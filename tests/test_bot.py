@@ -201,3 +201,13 @@ def test_cli_run_frames(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "attack" in out
+
+
+def test_cli_parser_has_tool_subcommands():
+    from maplebot.__main__ import build_parser
+
+    p = build_parser()
+    a = p.parse_args(["record-route", "my_map", "--map", "x.png"])
+    assert a.name == "my_map" and a.map == "x.png"
+    b = p.parse_args(["fetch-mob", "Orange Mushroom", "--version", "65"])
+    assert b.name == "Orange Mushroom" and b.version == "65"

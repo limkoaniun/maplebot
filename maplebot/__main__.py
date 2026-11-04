@@ -25,6 +25,29 @@ def _run(args) -> int:
     return 0
 
 
+def _record_route(args) -> int:
+    from maplebot.capture.source import ImageSource, VideoSource
+    from maplebot.tools.route_recorder import run_recorder
+
+    cfg = load_config(args.cfg)
+    if args.source:
+        source = VideoSource(args.source) if args.source.lower().endswith((".mp4", ".avi", ".mkv")) else ImageSource(args.source)
+    else:
+        from maplebot.capture.window import WindowCapture
+        source = WindowCapture(cfg)
+    out_dir = f"{cfg['route'].get('dir', 'minimaps')}/{args.name}"
+    run_recorder(cfg, source, out_dir, existing_map=args.map)
+    return 0
+
+
+def _fetch_mob(args) -> int:
+    from maplebot.tools.fetch_mob import fetch_mob
+
+    n = fetch_mob(args.name, args.out, args.region, args.version)
+    print(f"saved {n} sprite(s) to {args.out}/{args.name.lower().replace(' ', '_')}/")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="maplebot", description="Pure-vision MapleStory auto-leveling bot")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -38,6 +61,20 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--monsters", default=None, help="comma-separated monster folder names")
     r.add_argument("--frames", type=int, default=None, help="stop after N frames (debugging)")
     r.set_defaults(func=_run)
+
+    rr = sub.add_parser("record-route", help="stitch map.png and paint route*.png while you walk")
+    rr.add_argument("name", help="map folder name under route.dir (e.g. my_map)")
+    rr.add_argument("--cfg", default=None)
+    rr.add_argument("--source", default=None, help="video/PNG instead of the live window")
+    rr.add_argument("--map", default=None, help="continue from an existing map.png")
+    rr.set_defaults(func=_record_route)
+
+    fm = sub.add_parser("fetch-mob", help="download monster sprites from maplestory.io")
+    fm.add_argument("name", help='mob name as listed on maplestory.wiki, e.g. "Orange Mushroom"')
+    fm.add_argument("--out", default="monster")
+    fm.add_argument("--region", default="GMS")
+    fm.add_argument("--version", default="83")
+    fm.set_defaults(func=_fetch_mob)
     return p
 
 

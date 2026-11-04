@@ -15,17 +15,17 @@ def _world(seed=1, w=400, h=300):
 
 def test_stitcher_grows_canvas_and_places_second_crop():
     world = _world()
-    st = MapStitcher(padding=10)
+    st = MapStitcher(padding=30)
     a = world[50:150, 60:180]
     pos_a = st.add(a, player_dot=(10, 10))
-    assert pos_a == (10, 10)
-    assert st.map.shape[:2] == (120, 140)
-    b = world[80:180, 120:240]   # shifted +60 x, +30 y from a
+    assert pos_a == (30, 30)
+    assert st.map.shape[:2] == (160, 180)
+    b = world[65:165, 80:200]   # shifted +20 x, +15 y from a
     pos_b = st.add(b, player_dot=(5, 5))
-    assert pos_b == (70, 40)
-    assert st.map.shape[:2] == (160, 210)   # grew right/bottom with padding
+    assert pos_b == (50, 45)
+    assert st.map.shape[:2] == (175, 200)   # grew right/bottom to keep the padding
     # the stitched map now contains b's pixels at the right place
-    assert np.array_equal(st.map[40:140, 70:190], b) or np.array_equal(st.map[41:140, 71:190], b[1:, 1:])
+    assert np.array_equal(st.map[45:145, 50:170], b)
 
 
 def test_stitcher_blanks_player_dot():
@@ -69,3 +69,22 @@ def test_command_from_keys():
     assert command_from_keys({"up", "e"}, "space", "e") == Command("none", "up", "teleport")
     assert command_from_keys({"up"}, "space", "e") == Command("none", "up")
     assert command_from_keys(set(), "space", "e") is None
+
+
+def test_save_zip_frames_skips_death_frames(tmp_path):
+    import io
+    import zipfile
+
+    from maplebot.tools.fetch_mob import save_zip_frames
+
+    png = cv2.imencode(".png", np.zeros((4, 4, 3), np.uint8))[1].tobytes()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("stand/0.png", png)
+        z.writestr("move/0.png", png)
+        z.writestr("die1/0.png", png)
+        z.writestr("info.json", b"{}")
+    n = save_zip_frames(buf.getvalue(), str(tmp_path / "monster"), "snail")
+    assert n == 2
+    files = sorted(p.name for p in (tmp_path / "monster" / "snail").iterdir())
+    assert files == ["snail_move_0.png", "snail_stand_0.png"]
