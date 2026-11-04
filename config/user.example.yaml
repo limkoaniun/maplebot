@@ -1,0 +1,12 @@
+# Copy to config/user.yaml and edit. Only keys you set here override config/default.yaml.
+game_window:
+  title: "MapleStory"
+keys:
+  attack: w
+  aoe: q
+  hp_potion: "1"
+  mp_potion: "2"
+route:
+  map: ""           # e.g. north_forest_training_ground_2
+monsters:
+  names: []         # e.g. [green_mushroom, spike_mushroom]
