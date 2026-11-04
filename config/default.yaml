@@ -24,6 +24,7 @@ keys:
   hp_potion: "1"
   mp_potion: "2"
   pickup: ""            # "" to disable periodic pickup while moving
+  pickup_interval_s: 0.3
 
 buffs:
   keys: []              # e.g. ["a", "s"]
