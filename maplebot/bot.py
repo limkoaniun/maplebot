@@ -27,6 +27,7 @@ from maplebot.vision.template import make_mask
 
 log = get_logger()
 DOT_LOST_FRAMES = 15
+MAP_MATCH_MAX_SCORE = 0.5  # masked SQDIFF_NORMED above this = the minimap is not on the map (occluded / loading)
 
 
 @dataclass
@@ -78,6 +79,7 @@ class Bot:
         self.last_snapshot: BotSnapshot | None = None
         self._minimap_loc: tuple[int, int] | None = None
         self._dot_lost = 0
+        self._minimap_seen = False  # minimap box and player dot both found on the current frame
         self._t_last: float | None = None
         self._tmpl = None
         self._tmpl_mask = None
@@ -138,6 +140,7 @@ class Bot:
         mcfg = self.cfg["minimap"]
         fixed = mcfg.get("fixed_rect")
         box = Box(*map(int, fixed)) if fixed else find_minimap(frame)
+        self._minimap_seen = box is not None
         if box is not None:
             self.minimap_box = box
         if self.minimap_box is None:
@@ -152,16 +155,20 @@ class Bot:
             self.minimap_pos = dot
             self._dot_lost = 0
         else:
+            self._minimap_seen = False
             self._dot_lost += 1
             if self._dot_lost >= DOT_LOST_FRAMES:
                 self.minimap_pos = None  # allow a fresh lock after a teleport / map change
         return img
 
     def _update_global(self, img_mm: np.ndarray | None) -> None:
-        if self.route_map is None or img_mm is None or self.minimap_pos is None:
-            self.global_pos = None
+        if self.route_map is None or img_mm is None or self.minimap_pos is None or not self._minimap_seen:
+            self.global_pos = None  # navigation skips this frame; the route follower's grace handles it
             return
         res = locate_minimap_on_map(self.route_map.map_bgr, img_mm, last=self._minimap_loc)
+        if res.score > MAP_MATCH_MAX_SCORE:
+            self.global_pos = None
+            return
         self._minimap_loc = res.loc
         self.global_pos = (res.loc[0] + self.minimap_pos[0], res.loc[1] + self.minimap_pos[1])
 
@@ -204,6 +211,8 @@ class Bot:
         now = time.monotonic() if now is None else now
         raw = self.source.get_frame()
         if raw is None:
+            if self.keyboard is not None:
+                self.keyboard.set_command(Command.NONE)  # never keep walking on no picture
             return None
         frame = prepare_frame(raw, self.cfg["game_window"])
         h, w = frame.shape[:2]
@@ -321,7 +330,12 @@ def build_bot(cfg: dict, source_path: str | None, no_input: bool) -> Bot:
         from maplebot.capture.window import WindowCapture
         source = WindowCapture(cfg)
     backend = make_backend("null" if no_input else "pynput")
-    keyboard = KeyboardController(cfg, backend)
+    is_active = None
+    if not source_path:
+        from maplebot.capture.window import is_foreground
+        title = source.title
+        is_active = lambda: is_foreground(title)  # noqa: E731  keys only go to the game window
+    keyboard = KeyboardController(cfg, backend, is_active=is_active)
 
     mcfg = cfg["monsters"]
     per = mcfg.get("per_monster") or {}

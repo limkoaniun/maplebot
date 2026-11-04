@@ -25,6 +25,7 @@ class MapStitcher:
         self.dot_radius = int(dot_radius)
         self.map: np.ndarray | None = None
         self.last_loc: tuple[int, int] | None = None
+        self.last_shift: tuple[int, int] = (0, 0)  # how far existing content moved on the last add()
 
     def _ensure_capacity(self, x: int, y: int, h: int, w: int) -> tuple[int, int]:
         mh, mw = self.map.shape[:2]
@@ -33,6 +34,7 @@ class MapStitcher:
         left = max(0, p - x)
         bottom = max(0, y + h + p - mh)
         right = max(0, x + w + p - mw)
+        self.last_shift = (left, top)
         if top or left or bottom or right:
             canvas = np.zeros((mh + top + bottom, mw + left + right, 3), np.uint8)
             canvas[top:top + mh, left:left + mw] = self.map
@@ -55,6 +57,7 @@ class MapStitcher:
             self.map = np.zeros((h + 2 * p, w + 2 * p, 3), np.uint8)
             self.map[p:p + h, p:p + w] = mm
             self.last_loc = (p, p)
+            self.last_shift = (0, 0)
             return (p, p)
         mask = (np.any(mm != 0, axis=2).astype(np.uint8) * 255)
         res = match_template(self.map, mm, mask=mask, last_loc=loc_hint or self.last_loc,
@@ -84,6 +87,19 @@ class RouteCanvas:
             img[np.all(img == np.array(bgr, np.uint8), axis=2)] = 0
         self.img = img
         self._last = None
+
+    def grow(self, new_map: np.ndarray, shift: tuple[int, int]) -> None:
+        """The stitched map grew (and its content moved by `shift`): move the painting with it."""
+        old = self.img
+        img = np.zeros_like(new_map)
+        dx, dy = int(shift[0]), int(shift[1])
+        h = min(old.shape[0], img.shape[0] - dy)
+        w = min(old.shape[1], img.shape[1] - dx)
+        if h > 0 and w > 0:
+            img[dy:dy + h, dx:dx + w] = old[:h, :w]
+        self.img = img
+        if self._last is not None:
+            self._last = (self._last[0] + dx, self._last[1] + dy)
 
     def mark(self, pos: tuple[int, int], command: Command, blob: bool) -> None:
         bgr = self.by_command.get(str(command))
@@ -216,13 +232,7 @@ def run_recorder(cfg: dict, source, out_dir: str, existing_map: str | None = Non
             if canvas is None:
                 canvas = RouteCanvas(stitcher.map, codes)
             elif canvas.img.shape[:2] != stitcher.map.shape[:2]:
-                grown = stitcher.map.copy()
-                grown[:] = 0
-                old = canvas.img
-                # keep what was painted, re-anchored at the top-left (canvas only grows right/bottom when
-                # the player walks there; growth to the left/top shifts content and is re-painted by the user)
-                grown[:old.shape[0], :old.shape[1]] = old
-                canvas.img = grown
+                canvas.grow(stitcher.map, stitcher.last_shift)
             gpos = None if last_dot is None else (loc[0] + last_dot[0], loc[1] + last_dot[1])
 
             if keys.pop_func("f1"):

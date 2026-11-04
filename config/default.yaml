@@ -118,6 +118,8 @@ health:
   mp_percent: 30
   rearm_delta: 5
   retry_s: 2.0
+  max_retries: 5               # after this many retries without recovery, slow down to one try per backoff_s
+  backoff_s: 30.0
   warmup_reads: 10
   ui_y_start: 610              # rows below this are the bottom UI strip
   fixed_rects: null            # [[x,y,w,h] hp, [x,y,w,h] mp, [x,y,w,h] exp] relative to full frame
@@ -132,10 +134,10 @@ stuck:
 search:
   enable: true
   trigger_frames: 4
-  flip_frames: 40
-  max_offset_px: 0
-  stall_frames: 8
-  attack_while_moving: true
+  flip_frames: 40              # frames before the sweep turns around
+  max_offset_px: 0             # turn around after walking this far from the start (0 = off)
+  stall_frames: 0              # 0 = off; the minimap dot moves < 1px/frame while walking, so a small value misfires
+  attack_while_moving: false   # attacking stops the character each swing; the bot attacks when a target is in range anyway
 
 debug:
   show: true

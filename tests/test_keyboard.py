@@ -143,3 +143,33 @@ def test_release_all_clears_state():
     assert be.held == set()
     kb.apply_once(0.1)
     assert be.held == {"right", "down"}
+
+
+# --- review fix pass -------------------------------------------------------
+
+def test_inactive_window_releases_and_skips():
+    cfg = deep_merge(load_config(), {})
+    be = RecordingBackend()
+    active = {"on": True}
+    kb = KeyboardController(cfg, be, sleep=lambda s: None, is_active=lambda: active["on"])
+    kb.set_command(Command("left", "none", "attack"))
+    kb.apply_once(0.0)
+    assert "left" in be.held
+    active["on"] = False
+    kb.apply_once(0.1)
+    assert be.held == set()
+    n = len(be.events)
+    kb.apply_once(0.2)
+    assert len(be.events) == n
+    active["on"] = True
+    kb.apply_once(5.0)
+    assert "left" in be.held
+
+
+def test_buff_without_cooldown_is_skipped():
+    kb, be = _kb(buffs={"keys": ["a"], "cooldowns_s": [], "freeze_s": 1.0})
+    kb.set_command(Command("left"))
+    kb.apply_once(0.0)
+    kb.apply_once(0.5)
+    assert not _taps(be, "a")
+    assert "left" in be.held

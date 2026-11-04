@@ -46,10 +46,12 @@ def read_bars(ui_bgr: np.ndarray, cfg_health: dict) -> tuple[float | None, float
     rects = cfg_health.get("fixed_rects")
     if rects:
         boxes = [Box(*map(int, r)) for r in rects]
+        if len(boxes) not in (2, 3):
+            return (None, None, None)
     else:
         boxes = find_status_bars(ui_bgr, int(cfg_health.get("bar_white_thresh", 240)))
-    if len(boxes) not in (2, 3):
-        return (None, None, None)
+        if len(boxes) != 3:  # a missed bar would shift HP/MP/EXP by position
+            return (None, None, None)
     vals: list[float | None] = []
     for b in boxes:
         crop = ui_bgr[b.y:b.y2, b.x:b.x2]

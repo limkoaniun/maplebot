@@ -47,11 +47,12 @@ def test_read_bars_detected():
     assert abs(hp - 50) <= 2 and abs(mp - 25) <= 2 and abs(exp - 75) <= 2
 
 
-def test_read_bars_two_bars_without_exp():
+def test_read_bars_two_bars_only_with_fixed_rects():
     ui = make_frame(1282, 83)
     for x, frac in ((100, 0.5), (400, 0.25)):
         ui[30:52, x:x + 165] = _bar(165, 22, fill_frac=frac)
-    hp, mp, exp = read_bars(ui, {"fixed_rects": None, "bar_white_thresh": 240})
+    assert read_bars(ui, {"fixed_rects": None, "bar_white_thresh": 240}) == (None, None, None)
+    hp, mp, exp = read_bars(ui, {"fixed_rects": [[100, 30, 165, 22], [400, 30, 165, 22]]})
     assert abs(hp - 50) <= 2 and abs(mp - 25) <= 2 and exp is None
 
 

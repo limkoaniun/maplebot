@@ -124,9 +124,12 @@ class RouteFollower:
         self.last_hit: RouteHit | None = None
 
     def step(self, pos: tuple[int, int] | None, on_ladder: bool) -> Command:
-        if pos is None or self.route.n_routes == 0:
+        if self.route.n_routes == 0:
             return Command.NONE
-        hit, hit_ud = nearest_command(self.route, self.idx, pos, self.search_range)
+        if pos is None:
+            hit = hit_ud = None
+        else:
+            hit, hit_ud = nearest_command(self.route, self.idx, pos, self.search_range)
         self.last_hit = hit or hit_ud
         if hit is None and hit_ud is None:
             self.miss_frames += 1

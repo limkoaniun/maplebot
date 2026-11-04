@@ -34,13 +34,14 @@ def _distance(det: Detection, player: tuple[int, int]) -> int:
 
 
 def choose_target(dets: list[Detection], player: tuple[int, int], cfg: dict, min_area: int,
-                  frame_w: int, frame_h: int) -> str | None:
+                  frame_w: int, frame_h: int, prefer: str | None = None) -> str | None:
     """Return "left" / "right" / "aoe" for the side worth attacking this frame, or None.
 
     A detection counts when its overlap with an attack box is at least
     min(min_area, min_overlap_px) and its centre lies on that box's side of the player.
     When both sides qualify and their nearest targets are within tie_margin_px of each
-    other, no direction is returned so the character does not flip back and forth.
+    other, the previous side (`prefer`) is kept if it still qualifies, otherwise no
+    direction is returned, so the character does not flip back and forth.
     """
     if not dets:
         return None
@@ -74,7 +75,7 @@ def choose_target(dets: list[Detection], player: tuple[int, int], cfg: dict, min
         return "left"
     if dr < dl - tie:
         return "right"
-    return None
+    return prefer if prefer in nearest else None
 
 
 class AttackTimer:

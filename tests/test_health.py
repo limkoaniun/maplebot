@@ -87,3 +87,16 @@ def test_buff_scheduler_due_once_per_cooldown():
 
 def test_buff_scheduler_empty():
     assert BuffScheduler({"keys": [], "cooldowns_s": []}).due(0.0) is None
+
+
+def test_policy_backs_off_after_repeated_failed_retries():
+    cfg = dict(CFG, retry_s=2.0, max_retries=3, backoff_s=30.0)
+    p = HealthPolicy(cfg)
+    t = _warm(p)
+    drinks = 0
+    for i in range(30):
+        if p.update(10, 100, t + i):
+            drinks += 1
+    # initial drink + 3 retries (t, t+2, t+4, t+6), then back off for 30 s
+    assert drinks == 4
+    assert p.update(10, 100, t + 6 + 30.5) == ["hp_potion"]

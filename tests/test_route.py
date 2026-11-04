@@ -143,3 +143,11 @@ def test_follower_miss_grace_then_stop(tmp_path, codes):
 def test_follower_none_position(tmp_path, codes):
     f = _follower(tmp_path, codes, [((10, 10), (255, 0, 0))])
     assert f.step(None, on_ladder=False) == Command.NONE
+
+
+def test_follower_none_position_uses_grace(tmp_path, codes):
+    f = _follower(tmp_path, codes, [((10, 10), (255, 0, 0))], miss_grace_frames=2)
+    assert f.step((10, 10), on_ladder=False) == Command("left")
+    assert f.step(None, on_ladder=False) == Command("left")
+    assert f.step(None, on_ladder=False) == Command("left")
+    assert f.step(None, on_ladder=False) == Command.NONE

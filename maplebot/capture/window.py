@@ -41,6 +41,28 @@ def window_rect(title: str) -> tuple[int, int, int, int] | None:
     return sl, st, r - l, b - t
 
 
+def is_foreground(title: str) -> bool:
+    import win32gui
+
+    try:
+        return win32gui.GetWindowText(win32gui.GetForegroundWindow()) == title
+    except Exception:
+        return False
+
+
+def set_dpi_aware() -> None:
+    """Make GetClientRect/ClientToScreen report physical pixels, like mss does, on scaled displays."""
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def activate_window(title: str) -> bool:
     import win32con
     import win32gui
@@ -62,6 +84,7 @@ class WindowCapture:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        set_dpi_aware()
         token = str(cfg["game_window"]["title"])
         self.title = find_window_title(token)
         if self.title is None:
@@ -108,6 +131,9 @@ class WindowCapture:
                             self._frame = frame
                     except Exception as e:
                         log.debug("grab failed: %s", e)
+                else:
+                    with self._lock:
+                        self._frame = None  # minimised / gone: report no frame rather than a stale one
                 dt = time.monotonic() - t0
                 if dt < period:
                     time.sleep(period - dt)

@@ -23,3 +23,9 @@ def test_load_config_user_override(tmp_path):
 
 def test_parse_color_codes():
     assert parse_color_codes({"255,0,0": "left none none"}) == {(255, 0, 0): "left none none"}
+
+
+def test_default_search_settings_do_not_jitter():
+    cfg = load_config()
+    assert cfg["search"]["stall_frames"] == 0
+    assert cfg["search"]["attack_while_moving"] is False

@@ -49,7 +49,7 @@ class _Src:
         pass
 
     def get_frame(self):
-        return self.frame.copy()
+        return None if self.frame is None else self.frame.copy()
 
 
 def _full_frame(sprite_x=741):
@@ -211,3 +211,45 @@ def test_cli_parser_has_tool_subcommands():
     assert a.name == "my_map" and a.map == "x.png"
     b = p.parse_args(["fetch-mob", "Orange Mushroom", "--version", "65"])
     assert b.name == "Orange Mushroom" and b.version == "65"
+
+
+# --- review fix pass -------------------------------------------------------
+
+def test_lost_minimap_stops_navigation_after_grace():
+    cfg = _cfg(route={"map": "nf2", "miss_grace_frames": 2})
+    codes = parse_color_codes(cfg["route"]["color_code"]), parse_color_codes(cfg["route"]["color_code_up_down"])
+    rm = RouteMap.load(FIX, *codes)
+    f = make_frame()
+    paste_minimap(f, 10, 60, 122, 102)
+    f[61:161, 11:131] = rm.map_bgr[60:160, 40:160]
+    f[90:93, 40:43] = YELLOW
+    bot, be = _bot(f, cfg, MonsterLibrary(), rm)
+    bot.step(now=0.0)
+    loc = bot._minimap_loc
+    assert loc == (40, 60)
+    bot.source.frame = make_frame()           # minimap gone (loading screen / occluded)
+    snaps = [bot.step(now=0.1 * i) for i in range(1, 5)]
+    assert all(s.global_pos is None for s in snaps)
+    assert bot._minimap_loc == loc
+    assert snaps[-1].command == Command.NONE
+
+
+def test_none_frame_sends_none_command(tmp_path):
+    bot, be = _bot(_full_frame(), _cfg(), _library(tmp_path))
+    bot.step(now=0.0)
+    assert bot.keyboard.cmd.action == "attack"
+    bot.source.frame = None
+    assert bot.step(now=0.1) is None
+    assert bot.keyboard.cmd == Command.NONE
+
+
+def test_auto_detected_bars_require_three():
+    from maplebot.vision.bars import read_bars
+
+    ui = make_frame(1282, 83)
+    bar = np.full((22, 165, 3), 255, np.uint8)
+    bar[1:21, 1:50] = (60, 60, 220)
+    bar[1:21, 50:164] = (90, 90, 90)
+    for x in (100, 400):
+        ui[30:52, x:x + 165] = bar
+    assert read_bars(ui, {"fixed_rects": None, "bar_white_thresh": 240}) == (None, None, None)

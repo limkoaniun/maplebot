@@ -15,8 +15,9 @@ log = get_logger()
 
 
 class KeyboardController:
-    def __init__(self, cfg: dict, backend, clock=time.monotonic, sleep=time.sleep):
+    def __init__(self, cfg: dict, backend, clock=time.monotonic, sleep=time.sleep, is_active=None):
         self.cfg = cfg
+        self.is_active = is_active or (lambda: True)  # e.g. "is the game window in the foreground"
         self.keys = cfg["keys"]
         self.backend = backend
         self.clock = clock
@@ -85,6 +86,10 @@ class KeyboardController:
 
     def apply_once(self, now: float) -> None:
         if not self.enabled:
+            return
+        if not self.is_active():
+            if self._held_x or self._held_y:
+                self.release_all()
             return
         with self._lock:
             cmd = self.cmd

@@ -88,3 +88,20 @@ def test_save_zip_frames_skips_death_frames(tmp_path):
     assert n == 2
     files = sorted(p.name for p in (tmp_path / "monster" / "snail").iterdir())
     assert files == ["snail_move_0.png", "snail_stand_0.png"]
+
+
+def test_stitcher_reports_shift_when_growing_left_and_canvas_follows():
+    world = _world(3)
+    st = MapStitcher(padding=30)
+    a = world[50:150, 100:220]
+    st.add(a, player_dot=None)
+    canvas = RouteCanvas(st.map, {(255, 0, 0): "left none none"})
+    canvas.mark((40, 40), Command("left"), blob=True)
+    b = world[50:150, 85:205]           # 15 px to the LEFT of a
+    pos_b = st.add(b, player_dot=None)
+    assert st.last_shift == (15, 0)
+    assert pos_b == (30, 30)
+    canvas.grow(st.map, st.last_shift)
+    assert canvas.img.shape[:2] == st.map.shape[:2]
+    assert tuple(canvas.img[40, 55]) == (0, 0, 255)      # painted blob moved with the map
+    assert tuple(canvas.img[40, 40]) == tuple(st.map[40, 40]) or not canvas.img[40, 40].any()

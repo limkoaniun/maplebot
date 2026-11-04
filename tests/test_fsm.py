@@ -84,7 +84,10 @@ def test_brain_sweeps_without_route():
     b = Brain(_cfg(search={"trigger_frames": 1}), None, 1200)
     assert b.decide(_p(frame_idx=0)) == Command.NONE
     cmd = b.decide(_p(frame_idx=1, now=0.1))
-    assert cmd.move_x in ("left", "right") and cmd.action == "attack"
+    assert cmd.move_x in ("left", "right") and cmd.action == "none"
+    b2 = Brain(_cfg(search={"trigger_frames": 1, "attack_while_moving": True}), None, 1200)
+    b2.decide(_p(frame_idx=0))
+    assert b2.decide(_p(frame_idx=1, now=0.1)).action == "attack"
 
 
 def test_brain_enters_recovering_when_stuck_and_exits_after_timeout():
@@ -133,3 +136,27 @@ def test_hunting_stops_after_grace(tmp_path):
     assert b.decide(_p(global_pos=(10, 10))) == Command("left")
     out = [b.decide(_p(global_pos=(40, 40), now=0.1 * i)) for i in range(1, 4)]
     assert out[0] == Command("left") and out[1] == Command("left") and out[2] == Command.NONE
+
+
+# --- review fix pass -------------------------------------------------------
+
+def test_brain_keeps_sweeping_when_detection_has_no_target():
+    # a monster just outside the attack box (margin only) must not freeze the sweep
+    b = Brain(_cfg(search={"trigger_frames": 1, "stall_frames": 0}), None, 1200)
+    for i in range(3):
+        cmd = b.decide(_p([_det(1000, 330)], frame_idx=i, now=0.1 * i, player=P))
+    assert cmd.move_x in ("left", "right")
+
+
+def test_brain_tie_keeps_previous_target():
+    b = Brain(_cfg(), _Route(Command("right")), 1200)
+    assert b.decide(_p([_det(500, 330)], now=0.0)).move_x == "left"
+    cmd = b.decide(_p([_det(521, 330), _det(721, 330)], now=0.1))
+    assert cmd.move_x == "left" and cmd.action == "attack"
+
+
+def test_brain_stuck_fires_with_untargetable_detection():
+    b = Brain(_cfg(stuck={"timeout_s": 1.0, "recover_s": 1.0}), _Route(Command("left")), 1200)
+    for t in (0.0, 0.5, 1.2):
+        b.decide(_p([_det(1000, 330)], now=t))
+    assert b.state == "recovering"
