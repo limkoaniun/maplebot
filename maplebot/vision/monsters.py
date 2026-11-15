@@ -29,6 +29,7 @@ class MonsterLibrary:
     templates: list[MonsterTemplate] = field(default_factory=list)
     names: list[str] = field(default_factory=list)
     _gray_cache: dict[int, np.ndarray] = field(default_factory=dict, repr=False)
+    _gray_match_cache: dict[int, tuple[np.ndarray, np.ndarray, float]] = field(default_factory=dict, repr=False)
 
     @property
     def min_area(self) -> int:
@@ -42,6 +43,31 @@ class MonsterLibrary:
         if key not in self._gray_cache:
             self._gray_cache[key] = t.gray
         return self._gray_cache[key]
+
+    def gray_difference(self, roi: np.ndarray, roi_squared: np.ndarray,
+                        t: MonsterTemplate) -> np.ndarray:
+        """Masked SQDIFF_NORMED with shared image energy and cached binary masks.
+
+        Two ordinary correlations evaluate the same score as OpenCV's masked
+        matcher, avoiding its repeated image conversion and mask work per pose.
+        """
+        if t.mask is None or t.mask.dtype != np.uint8 or t.mask.ndim != 2:
+            return cv2.matchTemplate(roi, self.gray_of(t).astype(np.float32),
+                                     cv2.TM_SQDIFF_NORMED, mask=t.mask)
+        key = id(t)
+        if key not in self._gray_match_cache:
+            mask = np.ascontiguousarray(t.mask > 0, dtype=np.float32)
+            template = self.gray_of(t).astype(np.float32) * mask
+            energy = float(np.sum(template * template))
+            self._gray_match_cache[key] = mask, template, energy
+        mask, template, energy = self._gray_match_cache[key]
+        product = cv2.matchTemplate(roi, template, cv2.TM_CCORR)
+        image_energy = cv2.matchTemplate(roi_squared, mask, cv2.TM_CCORR)
+        denominator = np.sqrt(np.maximum(image_energy * energy, 0))
+        numerator = np.maximum(image_energy + energy - 2 * product, 0)
+        # Blank/empty masks produce undefined normalized scores and cannot match.
+        return np.divide(numerator, denominator, out=np.ones_like(product),
+                         where=denominator > 0)
 
     @classmethod
     def load(cls, root: str, names: list[str], scales_by_name: dict[str, list[float]],
@@ -114,7 +140,8 @@ def detect_monsters(roi_bgr: np.ndarray, lib: MonsterLibrary, cfg: dict,
             roi = roi_bgr.copy()
             roi[e.y:e.y2, e.x:e.x2] = 0
     mode = cfg.get("mode", "color")
-    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if mode == "grayscale" else None
+    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32) if mode == "grayscale" else None
+    roi_squared = roi_gray * roi_gray if roi_gray is not None else None
     max_matches = int(cfg.get("max_matches_per_template", 50))
     rh, rw = roi.shape[:2]
 
@@ -125,8 +152,13 @@ def detect_monsters(roi_bgr: np.ndarray, lib: MonsterLibrary, cfg: dict,
             continue
         thres = float(_per_monster(cfg, t.name, "diff_thres", 0.25))
         min_spread = float(_per_monster(cfg, t.name, "min_color_spread", 0))
+        color_thres = _per_monster(cfg, t.name, "color_diff_thres", None)
         if mode == "grayscale":
-            res = cv2.matchTemplate(roi_gray, lib.gray_of(t), cv2.TM_SQDIFF_NORMED, mask=t.mask)
+            if cfg.get("fast_grayscale", True):
+                res = lib.gray_difference(roi_gray, roi_squared, t)
+            else:
+                res = cv2.matchTemplate(roi_gray, lib.gray_of(t).astype(np.float32),
+                                        cv2.TM_SQDIFF_NORMED, mask=t.mask)
         else:
             res = cv2.matchTemplate(roi, t.img_bgr, cv2.TM_SQDIFF_NORMED, mask=t.mask)
         res = np.nan_to_num(res, nan=1.0, posinf=1.0, neginf=1.0)
@@ -136,8 +168,16 @@ def detect_monsters(roi_bgr: np.ndarray, lib: MonsterLibrary, cfg: dict,
         order = np.argsort(res[ys, xs])[:max_matches]
         for i in order:
             x, y = int(xs[i]), int(ys[i])
-            if min_spread > 0 and color_spread(roi[y:y + th, x:x + tw], t.mask) < min_spread:
+            patch = roi[y:y + th, x:x + tw]
+            if min_spread > 0 and color_spread(patch, t.mask) < min_spread:
                 continue
+            # A grey cloud and an orange cap can have the same luminance.
+            # Verify candidate colours without paying for a full colour search.
+            if mode == "grayscale" and color_thres is not None:
+                color_score = float(cv2.matchTemplate(
+                    patch, t.img_bgr, cv2.TM_SQDIFF_NORMED, mask=t.mask)[0, 0])
+                if not np.isfinite(color_score) or color_score > float(color_thres):
+                    continue
             dets.append(Detection(t.name, Box(x + ox, y + oy, tw, th), float(res[y, x])))
     return nms(dets, iou_thres=0.4)
 

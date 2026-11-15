@@ -1,0 +1,59 @@
+{
+  "construction_ladder_occlusion": {
+    "player": [
+      55,
+      27
+    ],
+    "crop": [
+      600,
+      450,
+      115,
+      85
+    ]
+  },
+  "construction_visible": {
+    "player": [
+      55,
+      29
+    ],
+    "crop": [
+      600,
+      460,
+      115,
+      80
+    ]
+  },
+  "construction_hanging": {
+    "player": [
+      55,
+      28
+    ],
+    "crop": [
+      600,
+      505,
+      115,
+      70
+    ]
+  },
+  "henesys_rope": {
+    "player": [
+      55,
+      27
+    ],
+    "crop": [
+      580,
+      450,
+      115,
+      80
+    ]
+  },
+  "hud_distractor": {
+    "player": null,
+    "crop": [
+      340,
+      740,
+      100,
+      28
+    ]
+  }
+}

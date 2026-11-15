@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import ClassVar
 
 MOVE_X = ("none", "left", "right", "stop")
 MOVE_Y = ("none", "up", "down", "stop")
-ACTIONS = ("none", "jump", "attack", "aoe", "teleport", "goal")
+ACTIONS = ("none", "jump", "attack", "aoe", "normal_attack", "teleport", "goal")
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,8 @@ class Command:
     move_x: str = "none"
     move_y: str = "none"
     action: str = "none"
+    face_x: str = "none"  # face a close target without holding movement
+    valid_for_s: float | None = field(default=None, compare=False)
 
     NONE: ClassVar["Command"]
 
@@ -26,6 +29,12 @@ class Command:
             raise ValueError(f"bad move_y {self.move_y!r}")
         if self.action not in ACTIONS:
             raise ValueError(f"bad action {self.action!r}")
+        if self.face_x not in ("none", "left", "right"):
+            raise ValueError(f"bad face_x {self.face_x!r}")
+        if self.valid_for_s is not None and (
+                not isinstance(self.valid_for_s, (int, float)) or isinstance(self.valid_for_s, bool)
+                or not math.isfinite(self.valid_for_s) or self.valid_for_s <= 0):
+            raise ValueError("valid_for_s must be finite and positive")
 
     @classmethod
     def parse(cls, text: str) -> "Command":
@@ -35,7 +44,8 @@ class Command:
         return cls(*parts)
 
     def replace(self, **kw) -> "Command":
-        d = {"move_x": self.move_x, "move_y": self.move_y, "action": self.action}
+        d = {"move_x": self.move_x, "move_y": self.move_y, "action": self.action,
+             "face_x": self.face_x, "valid_for_s": self.valid_for_s}
         d.update(kw)
         return Command(**d)
 

@@ -47,7 +47,7 @@ def route_preview(route_map, idx: int, global_pos: tuple[int, int] | None, zoom:
     return cv2.resize(crop, (crop.shape[1] * zoom, crop.shape[0] * zoom), interpolation=cv2.INTER_NEAREST)
 
 
-def draw_debug(frame_bgr: np.ndarray, snap, cfg: dict) -> np.ndarray:
+def draw_debug(frame_bgr: np.ndarray, snap, cfg: dict, *, minimap_offset=(0, 0)) -> np.ndarray:
     img = frame_bgr.copy()
     h, w = img.shape[:2]
 
@@ -55,9 +55,11 @@ def draw_debug(frame_bgr: np.ndarray, snap, cfg: dict) -> np.ndarray:
         _rect(img, snap.minimap_box, RED, "minimap")
         if snap.minimap_pos is not None:
             mx, my = snap.minimap_pos
-            cv2.circle(img, (snap.minimap_box.x + mx, snap.minimap_box.y + my), 4, GREEN, -1)
+            cv2.circle(img, (round(snap.minimap_box.x + mx - minimap_offset[0]),
+                            round(snap.minimap_box.y + my - minimap_offset[1])), 4, GREEN, -1)
         for ox, oy in snap.other_players:
-            cv2.circle(img, (snap.minimap_box.x + ox, snap.minimap_box.y + oy), 4, RED, 1)
+            cv2.circle(img, (round(snap.minimap_box.x + ox - minimap_offset[0]),
+                            round(snap.minimap_box.y + oy - minimap_offset[1])), 4, RED, 1)
 
     if snap.player is not None:
         px, py = snap.player

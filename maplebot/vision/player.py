@@ -61,12 +61,14 @@ def locate_by_template(
     method: int = cv2.TM_SQDIFF_NORMED,
     local_radius: int = 60,
     source: str = "template",
+    local_only: bool = False,
 ) -> PlayerFix | None:
     """Match `tmpl` (BGR or gray; `frame` is converted to match) and anchor at its bottom-centre + offset.
 
     split_width > 0 matches vertical strips independently and keeps the best one, which survives
     partial occlusion (ladders, other players). flip=True also tries the mirrored template.
     `last` is the previous *fix* position; the local search window is derived from it.
+    local_only=True requires `last` and confines every match to that bounded crop.
     """
     if tmpl.ndim == 2 and frame.ndim == 3:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -80,6 +82,20 @@ def locate_by_template(
     last_tl = None
     if last is not None:
         last_tl = (last[0] - offset[0] - tw // 2, last[1] - offset[1] - th)
+
+    origin = (0, 0)
+    if local_only:
+        if last_tl is None:
+            return None
+        radius = max(0, int(local_radius))
+        lx, ly = last_tl
+        x0, y0 = max(0, lx - radius), max(0, ly - radius)
+        x1, y1 = min(frame.shape[1], lx + radius + tw), min(frame.shape[0], ly + radius + th)
+        if x1 - x0 < tw or y1 - y0 < th:
+            return None
+        frame = frame[y0:y1, x0:x1]
+        origin = (x0, y0)
+        last_tl = (lx - x0, ly - y0)
 
     best: tuple[float, tuple[int, int]] | None = None
     for t, m in variants:
@@ -106,4 +122,5 @@ def locate_by_template(
     if best is None:
         return None
     score, (x, y) = best
-    return PlayerFix(x + tw // 2 + int(offset[0]), y + th + int(offset[1]), score=score, source=source)
+    return PlayerFix(x + origin[0] + tw // 2 + int(offset[0]),
+                     y + origin[1] + th + int(offset[1]), score=score, source=source)

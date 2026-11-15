@@ -6,6 +6,10 @@ log/
 screenshot/
 video/
 config/user.yaml
+config/map_profiles/
 *.egg-info/
 build/
 dist/
+
+# One-off calibration helper requires an old private capture and overwrites assets.
+scripts/calibrate_player.py

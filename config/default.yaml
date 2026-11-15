@@ -114,7 +114,11 @@ route:
 
 health:
   enable: true
-  hp_percent: 50
+  hp_percent: 60
+  minimum_hp_percent: 50
+  protect_on_route_failure: true
+  protection_retry_s: 1.0
+  protection_max_taps: 3
   mp_percent: 30
   rearm_delta: 5
   retry_s: 2.0
