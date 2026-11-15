@@ -51,16 +51,43 @@ class Brain:
         self._recover_jumped = False
         self._combat_memory = None
         self._selected_detection = None
+        self._raw_detections: list[Detection] = []
         self._reacquire_s = 0.4
         self._pursuit_s = float(self.attack_cfg.get("pursuit_s", 1.2))
         if not math.isfinite(self._pursuit_s) or not 0 <= self._pursuit_s <= 3:
             raise ValueError("attack.pursuit_s must be between 0 and 3 seconds")
         self._pursuit_key = self._pursuit_started = self._pursuit_seen = None
+        # Opt-in: fight a fresh in-range monster during the pre-takeoff part of a
+        # transition, for at most this much active time per waypoint selection.
+        pre = self.attack_cfg.get("pre_transition_s", 0)
+        if (not isinstance(pre, (int, float)) or isinstance(pre, bool)
+                or not math.isfinite(pre) or not 0 <= pre <= 10):
+            raise ValueError("attack.pre_transition_s must be between 0 and 10 seconds")
+        self._pre_transition_s = float(pre)
+        self._pre_key = self._decide_last = None
+        self._pre_spent = self._frame_dt = 0.0
+        # One pre-takeoff fight: the side it faces, when a qualifying detection
+        # was last seen, and whether the previous decided frame belonged to it.
+        self._pre_side = self._pre_seen = None
+        self._pre_engaged = False
+        # Optional same-surface test: a target's sprite bottom must rest on the
+        # player's own platform surface (slope-aware), not merely overlap the band.
+        surface = self.attack_cfg.get("surface") or {}
+        self._surface_enabled = bool(surface.get("enabled", False))
+        self._feet_offset = float(surface.get("feet_offset_px", 12))
+        self._surface_above = float(surface.get("above_px", 32))
+        self._surface_below = float(surface.get("below_px", 22))
+        self._scale_y = float(circuit_cfg.get("pixels_per_minimap_y", circuit_cfg.get("pixels_per_minimap_x", 10)))
+        values = (self._feet_offset, self._surface_above, self._surface_below, self._scale_y)
+        if (not all(math.isfinite(v) for v in values) or min(values[1:]) < 0 or self._scale_y <= 0
+                or abs(self._feet_offset) > 200 or max(values[1:3]) > 200):
+            raise ValueError("attack.surface offsets and the vertical minimap scale must be finite and bounded")
 
     # -- helpers -------------------------------------------------------
     def suspend(self, now: float) -> None:
         self._clear_combat_memory()
         self._pursuit_seen = None
+        self._end_pre_fight()
         if self.circuit is not None:
             self.circuit.suspend(now)
         self.loot.suspend(now)
@@ -80,6 +107,18 @@ class Brain:
             return None
         return platform
 
+    def _minimap_x(self, p: Perception, det: Detection) -> float:
+        return p.minimap_pos[0] + (det.box.center[0] - p.player[0]) / self.loot.scale
+
+    def _surface_offset(self, platform, p: Perception, det: Detection) -> float:
+        """Sprite bottom relative to the platform surface under it (+ = lower on screen)."""
+        rise = platform.y_at(self._minimap_x(p, det)) - platform.y_at(p.minimap_pos[0])
+        return det.box.y2 - (p.player[1] + self._feet_offset + rise * self._scale_y)
+
+    def _on_player_surface(self, platform, p: Perception, det: Detection) -> bool:
+        return (not self._surface_enabled
+                or -self._surface_above <= self._surface_offset(platform, p, det) <= self._surface_below)
+
     def _remember_target(self, p: Perception, target: str) -> None:
         boxes = attack_boxes(p.player, self.attack_cfg, p.frame_w, p.frame_h)
         box = boxes.get(target)
@@ -96,7 +135,10 @@ class Brain:
                     "relative": (det.box.center[0] - p.player[0], det.box.center[1] - p.player[1])}
             platform = self.circuit.platform_at(p.minimap_pos) if self.circuit is not None else None
             bounds = (platform.left, platform.right) if platform is not None else None
-            self.loot.observe(p.minimap_pos, p.player, det.box.center, p.now, p.minimap_w, bounds)
+            visible = ([self._minimap_x(p, d) for d in self._raw_detections]
+                       if p.minimap_pos is not None else None)
+            self.loot.observe(p.minimap_pos, p.player, det.box.center, p.now, p.minimap_w, bounds,
+                              platform=platform, visible_x=visible)
 
     def _choose_target(self, p: Perception) -> str | None:
         self._selected_detection = None
@@ -179,12 +221,87 @@ class Brain:
                 self._pursuit_started = p.now
             self._pursuit_seen = p.now
             self.state = "pursuing_target"
-            self.loot.cancel()  # a currently visible living target is not a confirmed drop
+            # A visible living target is not a drop; a visit already begun is kept for later.
+            self.loot.yield_to_target(p.now)
             return Command(direction)
         if self._pursuit_seen is not None and 0 <= p.now - self._pursuit_seen < self._reacquire_s:
             self.state = "reacquiring_target"
             return Command.NONE  # no stale movement or attacks during a detection gap
         return None
+
+    def _end_pre_fight(self) -> None:
+        self._pre_side = self._pre_seen = None
+        self._pre_engaged = False
+
+    def _track_frame(self, p: Perception) -> None:
+        """Per-frame bookkeeping for the pre-takeoff combat budget."""
+        last, self._decide_last = self._decide_last, p.now
+        # A long gap is charged as one second, so slow frames stay bounded too.
+        self._frame_dt = 0.0 if last is None else min(1.0, max(0.0, p.now - last))
+        nav = self.circuit
+        key = None if nav is None else (nav.idx, bool(nav.returning_to_start))
+        if key != self._pre_key:
+            self._pre_key, self._pre_spent = key, 0.0  # next waypoint, or a return began/ended
+            self._end_pre_fight()
+
+    def _pre_transition_fight(self, p: Perception) -> Command | None:
+        """Command for a frame of a pre-takeoff fight, or None when the circuit steps.
+
+        `p.detections` is already the fresh list ordinary combat uses (platform
+        bounds and same-surface filter). No combat memory is consulted, so a frame
+        without a qualifying detection never attacks.
+
+        A fight is a window, not isolated frames: once a qualifying detection was
+        attacked, frames without one keep the circuit suspended (no keys) for up
+        to `_reacquire_s`, because a circuit stepped for a frame or two between
+        attacks cannot finish a settle or a release while its timeout clock runs.
+        Every frame that follows a fight frame is charged to the allowance, so the
+        stall is bounded by it whatever the detection pattern.
+        """
+        nav = self.circuit
+        engaged, self._pre_engaged = self._pre_engaged, False
+        if not self._pre_transition_s:
+            return None
+        exhausted = self._pre_spent >= self._pre_transition_s
+        if engaged and not exhausted:
+            self._pre_spent += self._frame_dt
+        if (exhausted or self._supported_combat_platform(p) is None
+                or not nav.takeoff_interruptible(p.minimap_pos)):
+            self._end_pre_fight()
+            return None
+        # Keep the side already being fought while it still has a fresh qualifying
+        # detection; with a monster on each side the nearest one changes per frame.
+        self.target = self._pre_side
+        target = self._choose_target(p)
+        if target is not None:
+            if not engaged:
+                self._pre_spent += self._frame_dt
+            self._pre_side, self._pre_seen, self._pre_engaged = target, p.now, True
+            # Uncommitted only: suspend drops the alignment/settle proof, so
+            # the takeoff needs a fresh one after the fight.
+            nav.suspend(p.now)
+            self.state = "hunting"
+            return self._pre_transition_combat(p, target)
+        if self._pre_seen is not None and 0 <= p.now - self._pre_seen < self._reacquire_s:
+            self._pre_engaged = True
+            self._clear_combat_memory()
+            nav.suspend(p.now)  # the circuit clock stays frozen for the whole fight
+            self.state = "reacquiring_target"
+            return Command.NONE  # no attack and no movement without a fresh detection
+        self._end_pre_fight()
+        return None
+
+    def _pre_transition_combat(self, p: Perception, target: str) -> Command:
+        """Ordinary combat command with every walk turned into facing.
+
+        `_combat` walks toward a target outside the deadzone, which with a wide
+        attack box can be many minimap pixels. Before a takeoff the character
+        stays where the route put it: it only turns and attacks.
+        """
+        cmd = self._combat(p, Command.NONE, target)
+        if cmd.move_x in ("left", "right"):
+            cmd = Command("none", "none", cmd.action, face_x=cmd.move_x)
+        return cmd
 
     def _combat(self, p: Perception, cmd: Command, target: str | None) -> Command:
         if target is None:
@@ -217,6 +334,7 @@ class Brain:
 
     # -- main entry ----------------------------------------------------
     def decide(self, p: Perception) -> Command:
+        self._track_frame(p)
         if self.circuit is not None and (self.movement_test or self.circuit.completed
                 or self.circuit.state == "blocked"
                 or getattr(self.circuit, "returning_to_start", False)
@@ -227,6 +345,7 @@ class Brain:
             self.state = "circuit_" + self.circuit.state
             return cmd
         observed_detections = bool(p.detections)
+        self._raw_detections = p.detections if p.player is not None else []
         platform = self.circuit.platform_at(p.minimap_pos) if self.circuit is not None else None
         bounds = (platform.left, platform.right) if platform is not None else None
         if self.circuit is not None and self.circuit.platforms:
@@ -234,14 +353,27 @@ class Brain:
                 p = replace(p, detections=[])
                 self.loot.cancel()
             else:
-                p = replace(p, detections=[d for d in p.detections
-                    if platform.left <= p.minimap_pos[0] + (d.box.center[0] - p.player[0]) / self.loot.scale <= platform.right])
+                raw = p.detections
+                p = replace(p, detections=[d for d in raw
+                    if platform.left <= self._minimap_x(p, d) <= platform.right
+                    and self._on_player_surface(platform, p, d)])
+                if self._surface_enabled:
+                    # A detection at this surface's height, in or out of the
+                    # platform bounds or mid-hop, is not a kill. A monster on a
+                    # lower or upper stair says nothing about the tracked target.
+                    observed_detections = any(
+                        -self._surface_above - 32 <= self._surface_offset(platform, p, d) <= self._surface_below
+                        for d in raw)
         if self._combat_memory is not None and (self._supported_combat_platform(p) != self._combat_memory["platform"]
                 or not 0 <= p.now - self._combat_memory["seen"] < self._reacquire_s):
             self._clear_combat_memory()
         if self.circuit is not None and self.circuit.transition_active:
             self._clear_combat_memory()
             self.loot.suspend(p.now)
+            fight = self._pre_transition_fight(p)
+            if fight is not None:
+                return fight
+            self._clear_combat_memory()
             cmd = self.circuit.step(p.minimap_pos, p.now, p.on_ladder)
             self.state = "circuit_" + self.circuit.state
             return cmd

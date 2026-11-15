@@ -141,6 +141,66 @@ def test_already_at_start_still_requires_stable_physical_confirmation(monkeypatc
     assert startup.state == "completed" and i >= 10 and nav.idx == 0 and nav.return_count == 0
 
 
+def test_start_from_unsupported_position_completes_only_after_verified_arrival(monkeypatch):
+    game, startup = _armed(monkeypatch)
+    nav = game.bot.brain.circuit
+    clock = [0.0]
+
+    def feed(pos, frames=1, dt=.125):
+        commands = []
+        for _ in range(frames):
+            commands.append(nav.step(pos, clock[0]))
+            clock[0] += dt
+            startup.update()
+        return commands
+
+    # (65,50) is above "middle" with nothing drawn under the feet: settle, then one leased pulse.
+    commands = feed((65, 50), 7)
+    assert commands[:6] == [Command.NONE] * 6
+    assert commands[6] == Command("left") and commands[6].valid_for_s == .25
+    assert nav.recovery_state == "regaining_support" and startup.state == "returning"
+    # The character falls onto "middle"; the stage sends nothing more and proves nothing.
+    assert feed((63, 55)) == [Command.NONE]
+    assert feed((63, 60), 4) == [Command.NONE] * 4
+    assert nav.recovery is None and nav.recovery_state == "waiting_source" and startup.state == "returning"
+    feed((63, 60))
+    assert nav.recovery is not None and nav.recovery_state == "running" and nav.idx == 0
+    for pos, frames in (((40, 60), 6), ((40, 70), 1), ((40, 80), 5), ((30, 80), 1)):
+        feed(pos, frames)
+        assert startup.state == "returning" and nav.returning_to_start
+    feed((10, 80), 6)
+    assert nav.recovery.completed and nav.recovery_state == "confirming_start"
+    assert startup.state == "returning" and nav.return_count == 1
+    for confirmations in range(1, 8):
+        feed((10, 80))
+        if startup.state != "returning":
+            break
+    assert confirmations >= 2  # stable point-1 proof, not the route index
+    assert nav.recovery_state == "completed" and not nav.returning_to_start
+    assert startup.state == "completed" and nav.idx == 0 and nav.return_count == 0
+    assert nav._regain.moves == 1
+
+
+def test_failed_regain_stage_fails_the_start_and_leaves_hp_only_input(monkeypatch):
+    game, startup = _armed(monkeypatch)
+    bot, nav = game.bot, game.bot.brain.circuit
+    for i in range(5):  # (110,50): no drawn platform below, none within 8 px beside
+        assert nav.step((110, 50), i * .125) == Command.NONE
+        startup.update()
+    assert nav.recovery_terminal and nav.recovery is None and nav.return_count == 1
+    assert startup.state == "failed"
+    assert "Could not reach a drawn platform from (110,50)" in startup.reason
+    assert "no drawn platform below or beside" in startup.reason
+    assert bot.paused and bot._manual_health_hold
+    game.step(55)
+    startup.update()
+    assert startup.state == "failed" and bot.keyboard.hp_only
+    game.step(75)
+    startup.update()
+    assert startup.state == "failed" and nav.recovery_terminal
+    game.only_hp_pressed()
+
+
 def test_failed_start_stays_in_hp_hold_and_never_auto_rearms(monkeypatch):
     game, startup = _armed(monkeypatch)
     bot, nav = game.bot, game.bot.brain.circuit

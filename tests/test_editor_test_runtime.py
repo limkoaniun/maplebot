@@ -166,6 +166,17 @@ def test_focus_wait_and_total_test_deadlines_are_checked_before_movement(tmp_pat
     assert not test.before_step(90, True) and test.state == "blocked"
 
 
+@pytest.mark.parametrize("timeout_s", [.2, 1.0, 1.5, 15, 99])
+def test_connection_test_with_commit_budget_accepts_its_own_clamped_timeout(tmp_path, timeout_s):
+    # The session clamps timeout_s into 1-15 s. The commit_budget defaults derived from it must
+    # not refuse the lower end under another key's name ("climb_travel_timeout_s must be ...").
+    circuit = {"enabled": True, "commit_budget": True, "timeout_s": timeout_s,
+               "waypoints": [{"x": 20, "y": 50}, {"x": 40, "y": 50}]}
+    test, _, _ = session(tmp_path, circuit=circuit)
+    built = test.cfg["route"]["circuit"]
+    assert built["commit_budget"] and built["timeout_s"] == min(15.0, max(1.0, timeout_s))
+
+
 @pytest.mark.parametrize("result", ["completed", "blocked", "cancelled", "capture"])
 def test_test_terminal_states_never_reenable_movement(tmp_path, result):
     test, _, snap = session(tmp_path)

@@ -17,6 +17,7 @@ from maplebot.capture.source import ImageSource, VideoSource, prepare_frame
 from maplebot.config import parse_color_codes
 from maplebot.control.backend import make_backend
 from maplebot.control.keyboard import KeyboardController
+from maplebot.evidence import EvidenceTracker
 from maplebot.health import HealthPolicy
 from maplebot.log import get_logger
 from maplebot.nav.route import RouteFollower, RouteMap, locate_minimap_on_map
@@ -52,6 +53,7 @@ class BotSnapshot:
     other_players: list[tuple[int, int]] = field(default_factory=list)
     paused: bool = False
     route_map: RouteMap | None = None
+    evidence: dict | None = None  # on-screen gain observations (lower bounds); None when evidence.enabled is false
 
     def summary(self) -> str:
         return (f"state={self.state} cmd=\"{self.command}\" player={self.player} minimap={self.minimap_pos} "
@@ -70,6 +72,8 @@ class Bot:
         self.follower = RouteFollower(route_map, cfg["route"]) if route_map is not None else None
         self.brain = Brain(cfg, self.follower, library.min_area)
         self.health = HealthPolicy(cfg["health"])
+        # Telemetry only: reads pixels of frames the loop already processed, never grants or sends input.
+        self.evidence = EvidenceTracker(cfg["evidence"]) if cfg.get("evidence", {}).get("enabled") else None
         self.paused = False
         self._control_lock = threading.RLock()
         self._control_generation = 0
@@ -359,6 +363,18 @@ class Bot:
                 log.info("%s (hp=%s mp=%s)", req, hp, mp)
         return hp, mp, exp
 
+    def _observe_evidence(self, frame, now: float, ok: bool, state: str | None = None) -> None:
+        """Count only on a fresh capture of the recognised map while not paused; anything else resets its baseline.
+
+        `state` replaces the brain state for the time bucket on a step that sent nothing because input
+        was held (suspended brain keeps its last state); pixel counting is unaffected.
+        """
+        if self.evidence is not None:
+            self.evidence.update(frame, now, self.brain.state if state is None else state, fresh=bool(ok))
+
+    def evidence_snapshot(self) -> dict | None:
+        return self.evidence.snapshot() if self.evidence is not None else None
+
     def pause_all(self) -> None:
         """An explicit user pause always revokes healing as well as farming."""
         with self._control_lock:
@@ -564,6 +580,8 @@ class Bot:
         nav = self.brain.circuit
         if nav is not None and nav.returning_to_start:
             nav.abort_return_to_start(reason)
+        if nav is not None and getattr(nav, "rejoining", False):
+            nav.cancel_platform_rejoin(reason)  # not terminal: the waypoint keeps its own timeout
         self.pause_all()
         self.map_reacquiring = False
         self.map_reacquire_reason = str(reason)
@@ -662,6 +680,7 @@ class Bot:
             raw = self.source.get_frame()
         if raw is None:
             self.capture_state = "stale_or_missing"
+            self._observe_evidence(None, now, False)
             self._invalidate_tracking(now)
             if self.map_recognizer is not None:
                 self.map_recognizer.reset()
@@ -678,6 +697,7 @@ class Bot:
             self._return_route_active = False
             # Keep the relay available for calibration without deriving motion from the wrong crop.
             self.brain.state = "map_" + self.map_match.state
+            self._observe_evidence(frame, now, False)
             snap = BotSnapshot(frame, None, None, None, None, [], Command.NONE,
                                self.brain.state, None, None, None, self.fps, None, paused=True)
             self.last_snapshot = snap
@@ -694,6 +714,7 @@ class Bot:
         foreground = self.keyboard is None or self.keyboard.is_active()
         health_snap = self._health_guard_step(frame, now, foreground)
         if health_snap is not None:
+            self._observe_evidence(frame, now, False)  # farming is held: no counting, no time bucket
             return health_snap
         nav = self.brain.circuit
         returning = bool(nav is not None and getattr(nav, "returning_to_start", False))
@@ -787,10 +808,12 @@ class Bot:
         # Defer requests one frame without consuming the health retry timer.
         hp, mp, exp = self._read_health(frame, now, allow_requests=not was_route_only)
 
+        evidence_state = None  # telemetry only: time bucket override for a step that idles
         if self.full_pause:
             self.paused = True
             self.brain.suspend(now)
             cmd = Command.NONE
+            evidence_state = "input_held"
         elif loot_visual_hold:
             self.brain.state = "looting_waiting_visual"
             cmd = Command.NONE
@@ -801,6 +824,7 @@ class Bot:
         elif self.paused or self._input_blocked or not foreground:
             self.brain.suspend(now)
             cmd = Command.NONE
+            evidence_state = "input_held"  # the suspended brain keeps a stale state; no key can be sent
         else:
             p = Perception(w, h, self.player.pos if self.player else None, self.global_pos, self.minimap_pos,
                            img_mm.shape[1] if img_mm is not None else None, self.on_ladder, dets, now, self.frame_idx)
@@ -829,6 +853,8 @@ class Bot:
                                           and (not self._input_blocked or self._vertical_minimap_active
                                                or self._minimap_route_active or self._return_route_active))
 
+        self._observe_evidence(frame, now, self.capture_state == "fresh" and self.map_ready and not self.paused,
+                               evidence_state)
         if self._t_last is not None and now > self._t_last:
             self.fps = 0.8 * self.fps + 0.2 * (1.0 / (now - self._t_last)) if self.fps else 1.0 / (now - self._t_last)
         self._t_last = now
@@ -836,7 +862,7 @@ class Bot:
         snap = BotSnapshot(frame, self.player.pos if self.player else None, self.minimap_box, self.minimap_pos,
                            self.global_pos, dets, cmd, self.brain.state, hp, mp, exp, self.fps,
                            self.follower.idx if self.follower else None, sb, self.brain.target, other,
-                           self.paused, self.route_map)
+                           self.paused, self.route_map, self.evidence_snapshot())
         self.last_snapshot = snap
         return snap
 

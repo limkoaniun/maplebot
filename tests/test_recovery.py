@@ -4,7 +4,7 @@ import pytest
 
 from maplebot.nav.circuit import MinimapCircuit
 from maplebot.nav.editor import compile_plan
-from maplebot.nav.recovery import plan_return_to_start, supported_platform
+from maplebot.nav.recovery import UnsupportedPosition, plan_return_to_start, supported_platform
 from maplebot.types import Command
 
 
@@ -168,7 +168,9 @@ def test_exhausted_return_reports_new_failure_point_and_original_reason():
 
 @pytest.mark.parametrize("reason", ["unsupported", "ambiguous", "moving"])
 def test_return_waits_without_input_then_stops_when_source_never_stabilizes(reason):
-    cfg = recovery_config()
+    # (65,42) has "middle" drawn below it, so the regain-support stage would walk
+    # there; this case pins the legacy wait with the stage switched off.
+    cfg = recovery_config(**({"return_regain_support": False} if reason == "unsupported" else {}))
     if reason == "ambiguous":
         cfg["editor_plan"]["platforms"].append({"id": "overlap", "left": 30, "right": 85, "y": 40})
     nav = MinimapCircuit(cfg)
@@ -249,6 +251,12 @@ def test_source_matching_keeps_strict_horizontal_bounds_and_quantized_slope_supp
         supported_platform(cfg, (111, 30))
     with pytest.raises(ValueError, match="not supported"):
         supported_platform(cfg, (100, 37))
+    with pytest.raises(UnsupportedPosition):
+        supported_platform(cfg, (100, 37))
+    cfg["editor_plan"]["platforms"].append({"id": "overlap", "left": 30, "right": 85, "y": 40})
+    with pytest.raises(ValueError, match="ambiguous") as ambiguous:
+        supported_platform(cfg, (65, 40))
+    assert not isinstance(ambiguous.value, UnsupportedPosition)
 
 
 @pytest.mark.parametrize("value", [0, 4, 1.5, True])
@@ -261,3 +269,108 @@ def test_return_budget_validation(value):
 def test_return_health_threshold_validation(value):
     with pytest.raises(ValueError, match="return_min_hp_percent"):
         MinimapCircuit(recovery_config(return_min_hp_percent=value))
+
+
+def _legacy_plan_return_to_start(cfg, pos):
+    """The planner as it was before ``_plan_route`` was extracted (reference copy)."""
+    from maplebot.nav.circuit import Platform
+    from maplebot.nav.editor import validate_plan
+    from maplebot.nav.recovery import _circuit_config
+
+    cfg = _circuit_config(cfg)
+    source = supported_platform(cfg, pos)
+    points = cfg.get("waypoints") or []
+    if not points:
+        raise ValueError("Return needs an original first waypoint")
+    first = points[0]
+    plan = deepcopy(cfg["editor_plan"])
+    target_id = first.get("platform_id")
+    if target_id is None:
+        target_id = supported_platform(cfg, (first["x"], first["y"]))["id"]
+    target = next((p for p in plan["platforms"] if p["id"] == target_id), None)
+    if target is None:
+        raise ValueError("Point 1 refers to a missing platform")
+    surface = Platform(target["y"], target["left"], target["right"],
+                       target.get("right_y"), target.get("knots", ()))
+    if (not surface.left <= first["x"] <= surface.right
+            or abs(surface.y_at(first["x"]) - first["y"]) > .75):
+        raise ValueError("Point 1 is not on its saved platform")
+    plan.update(loop=False, route=[
+        {"platform_id": source["id"], "x": pos[0], "dwell_s": 0},
+        {"platform_id": target_id, "x": first["x"], "dwell_s": max(.6, first.get("dwell_s", 0))},
+    ])
+    without_jumps = deepcopy(plan)
+    without_jumps["connections"] = [c for c in without_jumps["connections"] if c["kind"] != "jump"]
+    if not validate_plan(without_jumps):
+        plan = without_jumps
+    result = compile_plan(plan, cfg)
+    result.update(editor_plan=plan, movement_test=True, return_on_block=False, max_retries=0,
+                  tolerance_y=min(.75, float(cfg.get("tolerance_y", 2))))
+    return result
+
+
+def _outcome(planner, cfg, pos):
+    try:
+        return "ok", planner(cfg, pos)
+    except (ValueError, KeyError) as exc:
+        return type(exc).__name__, str(exc)
+
+
+def _planner_variants():
+    jump_only = recovery_config()
+    jump_only["editor_plan"]["connections"] = [
+        c for c in jump_only["editor_plan"]["connections"] if c["id"] != "return-drop"]
+    jump_only["editor_plan"]["connections"].append({
+        "id": "jump-return", "kind": "jump", "from_platform": "upper", "to_platform": "ground",
+        "from_x": 65, "to_x": 10})
+    severed = recovery_config()
+    severed["editor_plan"]["connections"] = severed["editor_plan"]["connections"][:2]
+    no_id = recovery_config()
+    del no_id["waypoints"][0]["platform_id"]
+    missing = recovery_config()
+    missing["waypoints"][0]["platform_id"] = "gone"
+    off = recovery_config()
+    off["waypoints"][0]["y"] = 70
+    empty = recovery_config()
+    empty["waypoints"] = []
+    no_plan = recovery_config()
+    del no_plan["editor_plan"]
+    return [recovery_config(), {"route": {"circuit": recovery_config(tolerance_y=.5)}}, jump_only, severed,
+            no_id, missing, off, empty, no_plan]
+
+
+@pytest.mark.parametrize("pos", [(65, 40), (50, 60), (10, 80), (65, 42), (200, 40)])
+def test_extracted_route_planner_keeps_return_plans_and_messages_identical(pos):
+    outcomes = set()
+    for cfg in _planner_variants():
+        before = deepcopy(cfg)
+        new, old = _outcome(plan_return_to_start, cfg, pos), _outcome(_legacy_plan_return_to_start, cfg, pos)
+        assert new == old and cfg == before
+        outcomes.add(new[0] if new[0] != "ok" else "ok")
+    assert "ValueError" in outcomes or "UnsupportedPosition" in outcomes  # error paths were compared too
+
+
+def test_rejoin_planner_targets_the_waypoint_platform_with_both_keys_off():
+    from maplebot.nav.recovery import plan_rejoin
+
+    cfg = recovery_config(arrive_on_destination=True, platform_rejoin=True)
+    before = deepcopy(cfg)
+    points = cfg["waypoints"]
+    jump = next(i for i, p in enumerate(points) if p["action"] == "jump")
+    result = plan_rejoin(cfg, (65, 40), jump, 2)  # on "upper": back to the takeoff on "middle"
+    assert cfg == before
+    assert [p["connection_id"] for p in result["waypoints"] if p["action"] != "walk"] == ["return-drop"]
+    assert (result["waypoints"][-1]["platform_id"], result["waypoints"][-1]["x"]) == ("middle", 60)
+    assert result["waypoints"][-1]["dwell_s"] == 0 and result["movement_test"] and result["max_retries"] == 0
+    assert result["arrive_on_destination"] is False and result["platform_rejoin"] is False
+    assert any(c["kind"] == "jump" for c in result["editor_plan"]["connections"])  # graph kept whole
+    with pytest.raises(ValueError, match="too long"):
+        plan_rejoin(cfg, (65, 40), 0, 1)  # point 1 on "ground" needs the drop and the rope
+    assert len(plan_rejoin(cfg, (65, 40), 0, 2)["waypoints"]) >= 4
+    with pytest.raises(ValueError, match="Already on"):
+        plan_rejoin(cfg, (50, 60), jump, 2)
+    climb = next(i for i, p in enumerate(points) if p["action"] == "climb")
+    with pytest.raises(ValueError, match="does not support climb"):
+        plan_rejoin(cfg, (65, 40), climb, 2)
+    with pytest.raises(UnsupportedPosition):
+        plan_rejoin(cfg, (65, 42), jump, 2)

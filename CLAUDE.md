@@ -43,6 +43,7 @@ The controller was left farming at the end of the last supervised run. This is h
 | Startup and blocked-route recovery | `maplebot/recovery_runtime.py`, `maplebot/nav/recovery.py` |
 | HP protection | `maplebot/health_protection.py`, `maplebot/health.py` |
 | Combat and collection | `maplebot/brain/fsm.py`, `maplebot/vision/monsters.py`, `maplebot/vision/player.py`, `maplebot/nav/loot.py` |
+| On-screen gain evidence | `maplebot/evidence.py`, `maplebot/vision/gains.py` |
 
 ## Offline verification
 

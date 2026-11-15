@@ -45,10 +45,27 @@ def test_start_approach_accepts_saved_upper_entry_but_rejects_air_and_missing_co
     circuit = compile_plan(plan, {'editor_plan': plan})
     state = {'minimap_seen': True, 'minimap': [49, 88]}
     assert watcher.can_approach_start(state, circuit)
-    assert not watcher.can_approach_start({**state, 'minimap': [49, 90]}, circuit)
+    # Between the floors with drawn ground below: the controller may first regain
+    # support there, and ground has a path to point 1.
+    assert watcher.can_approach_start({**state, 'minimap': [49, 90]}, circuit)
+    assert not watcher.can_approach_start({**state, 'minimap': [49, 90]},
+                                          {**circuit, 'return_regain_support': False})
+    assert not watcher.can_approach_start({**state, 'minimap': [150, 90]}, circuit)  # nothing drawn below
     assert not watcher.can_approach_start({**state, 'minimap_seen': False}, circuit)
     plan['connections'].clear()
-    assert not watcher.can_approach_start(state, compile_plan(plan, {'editor_plan': plan}))
+    disconnected = compile_plan(plan, {'editor_plan': plan})
+    assert not watcher.can_approach_start(state, disconnected)
+    # Above "entry": the first drawn floor underneath has no saved path to point 1.
+    assert not watcher.can_approach_start({**state, 'minimap': [49, 80]}, disconnected)
+    assert watcher.can_approach_start({**state, 'minimap': [49, 95]}, disconnected)  # lands on ground itself
+    # The first option decides: just past the end of a platform with no saved path,
+    # although the connected ground lies below as a later option.
+    plan['platforms'].append({'id': 'island', 'left': 64, 'right': 80, 'y': 95})
+    island = compile_plan(plan, {'editor_plan': plan})
+    from maplebot.nav.regain import regain_options
+    assert [o['platform_id'] for o in regain_options(island, (62, 95))] == ['island', 'ground', 'ground']
+    assert not watcher.can_approach_start({**state, 'minimap': [62, 95]}, island)
+    assert watcher.can_approach_start({**state, 'minimap': [62, 99]}, island)  # only ground below
 
 
 @pytest.fixture
@@ -321,3 +338,50 @@ def test_preflight_accepts_ground_approach_but_completion_stays_at_point_one(evi
     state["minimap"] = [43, 104]
     with pytest.raises(ValueError, match="ground platform"):
         watcher.preflight(bridge, require_foreground=True)
+
+
+def test_rejoin_states_at_a_constant_index_record_no_reset_and_the_landing_still_confirms(evidence):
+    tracker, sample, _ = evidence
+    sample(0)
+    for index in range(1, 10):
+        sample(index)
+    sample(10, circuit_state="waiting_floor", minimap=[93, 105])  # knocked back off the landing floor
+    for state in ("rejoin_starting", "rejoin_walking", "rejoin_jumping", "rejoin_airborne"):
+        sample(10, circuit_state=state, minimap=[93, 105], rejoin_active=True, rejoin_count=1,
+               rejoin_state="running")
+    assert not tracker.proofs[9].confirmed and not tracker.proofs[9].samples
+    for state in ("rejoin_jump_landing", "rejoin_confirming", "rejoined", "dwelling"):
+        sample(10, circuit_state=state, rejoin_count=1)
+    assert tracker.proofs[9].confirmed and not tracker.resets and tracker.observed == list(range(11))
+    summary = tracker.summary()
+    assert not summary["full_wrap_observed"]  # a rejoin is never a wrap
+    assert summary["maximum_rejoin_count"] == 1 and summary["maximum_return_count"] == 0
+    assert summary["arrivals_without_takeoff"] == 0
+
+
+def test_jump_accepted_by_arrival_confirms_its_landing_positionally_and_is_reported(evidence):
+    tracker, sample, _ = evidence
+    sample(0, arrival_count=4)  # counted since the controller started, not since this watch
+    for index in range(1, 17):
+        sample(index, arrival_count=4)
+    for state in ("jump_arrived_checking", "jump_arrived_aligning", "jump_arrived"):
+        sample(17, circuit_state=state, arrival_count=4)
+    assert not tracker.proofs[17].samples  # nothing before the index passes
+    for _ in range(3):
+        sample(18, circuit_state="walking", arrival_count=5)
+    assert tracker.proofs[17].confirmed
+    summary = tracker.summary()
+    assert summary["arrivals_without_takeoff"] == 1 and summary["maximum_rejoin_count"] == 0
+
+
+def test_rejoin_and_arrival_reporting_does_not_change_a_verified_lap(evidence):
+    tracker, sample, _ = evidence
+    for index in range(44):
+        for _ in range(3):
+            sample(index, rejoin_count=2 if index > 20 else 0, arrival_count=1 if index > 30 else 0)
+    sample(0)
+    summary = tracker.summary()
+    assert summary["full_wrap_observed"] and summary["stable_ground_return"]
+    assert summary["all_transition_indices_observed"] and summary["all_landings_observed"]
+    assert summary["maximum_rejoin_count"] == 2 and summary["arrivals_without_takeoff"] == 1
+    assert not summary["attempt_resets"]

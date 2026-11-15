@@ -22,6 +22,7 @@ from maplebot.bot import build_bot
 from maplebot.config import load_config
 from maplebot.editor_bridge import EditorBridge, capture_signature
 from maplebot.editor_test_runtime import EditorTestSession
+from maplebot.evidence import carry_over_tracker, record_snapshot, session_summary_lines
 from maplebot.recovery_runtime import request_return, request_hold, StartupReturn
 from maplebot.overlay import draw_debug, route_preview
 from maplebot.vision.bars import find_status_bars
@@ -119,6 +120,11 @@ def snapshot_details(bot, snap):
         'recovery_terminal': bool(circuit is not None and circuit.recovery_terminal),
         'recovery_index': circuit.recovery.idx if circuit is not None and circuit.recovery is not None else None,
         'recovery_count': len(circuit.recovery.waypoints) if circuit is not None and circuit.recovery is not None else 0,
+        'rejoin_active': bool(getattr(circuit, 'rejoining', False)),
+        'rejoin_count': getattr(circuit, 'rejoin_count', 0),
+        'rejoin_state': getattr(circuit, 'rejoin_state', 'idle'),
+        'rejoin_reason': getattr(circuit, 'rejoin_reason', None),
+        'arrival_count': getattr(circuit, 'arrival_count', 0),
         'loot_state': loot.state if loot is not None else None,
         'player_score': float(fix.score) if fix is not None else None,
         'player_source': fix.source if fix is not None else None,
@@ -161,6 +167,8 @@ def diagnostic_minimap(snap, bot):
             circuit = getattr(bot.brain, 'circuit', None)
             if circuit is not None and circuit.returning_to_start and circuit.recovery is not None:
                 circuit = circuit.recovery
+            elif circuit is not None and getattr(circuit, 'rejoining', False) and circuit.platform_rejoin is not None:
+                circuit = circuit.platform_rejoin
             if circuit is not None:
                 scale_x, scale_y = width / crop.shape[1], height / crop.shape[0]
                 for platform in circuit.platforms:
@@ -314,6 +322,8 @@ def run():
     last_trace = 0.0
     trace_index = 0
     session = None
+    evidence_tracker = None
+    final = {}  # last on-screen evidence and hp/mp/exp readings, kept for the stop publish
     print('Starting active Maplebot for player. F1 pause/resume, F12 stop.', flush=True)
     while not STOP.exists():
         normal_cfg = load_config(str(ROOT / 'config/user.yaml'))
@@ -328,6 +338,10 @@ def run():
             session, keep_paused, waiting = None, True, False
             continue
         bot.keyboard.backend = CountedBackend(bot.keyboard.backend, counts)
+        # One session's observations survive a reload or test; counts made under different evidence
+        # settings are kept in final['evidence_previous'] instead of being dropped.
+        bot.evidence = evidence_tracker = carry_over_tracker(
+            evidence_tracker, bot.evidence, final, lambda text: print(text, flush=True))
         bot.paused = session is not None or keep_paused or waiting
         if bot.paused:
             bot.pause_all()
@@ -583,7 +597,11 @@ def run():
                 elif startup is not None:
                     status.update(startup_return_state=startup.state, startup_return_reason=startup.reason)
                 status.update(snapshot_details(bot, snap))
+                # Pixel observations (lower bounds), not kill or item counts; None when disabled.
+                status['evidence'] = record_snapshot(final, bot.evidence_snapshot())
                 if snap is not None:
+                    final.update({key: value for key, value in
+                                  (('hp', snap.hp), ('mp', snap.mp), ('exp', snap.exp)) if value is not None})
                     status.update(player=snap.player, minimap=snap.minimap_pos,
                                   monsters=[d.name for d in snap.detections],
                                   command=str(snap.command), hp=snap.hp, mp=snap.mp,
@@ -602,6 +620,7 @@ def run():
             publish_test(session)
             restore_normal = True
         total_frames += bot.frame_idx
+        record_snapshot(final, bot.evidence_snapshot())
         keep_paused = bot.paused
         if external_stop:
             cancelled = session if session is not None else pending_test
@@ -638,7 +657,12 @@ def run():
             break
         RELOAD.unlink(missing_ok=True)
         print('Applying updated settings.', flush=True)
-    publish({'running': False, 'frames': total_frames, 'keys_sent': dict(counts)})
+    publish({'running': False, 'frames': total_frames, 'keys_sent': dict(counts), **final})
+    lines = session_summary_lines(final)
+    print('Session ' + lines[0] + ' | last readings '
+          + ' '.join(f'{key}={final.get(key)}' for key in ('hp', 'mp', 'exp')), flush=True)
+    for line in lines[1:]:
+        print('Session ' + line, flush=True)
     print('Active Maplebot stopped; keys released.', flush=True)
 
 if __name__ == '__main__':

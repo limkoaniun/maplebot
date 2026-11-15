@@ -34,6 +34,11 @@ class KeyboardController:
                 raise ValueError(f"safety.{name} must be finite and positive")
         self.cmd = Command.NONE
         self._command_deadline: float | None = None
+        # Capture stamp of the last stamped set_command, and the deadline each
+        # leased (valid_for_s) command was first granted for that capture.  A
+        # repeat send for the same capture may only shorten such a pulse.
+        self._command_source_time: float | None = None
+        self._pulse_deadlines: dict[Command, float] = {}
         self._navigation_only = False
         self._hp_only = False
         self.hp_taps_sent = 0
@@ -65,6 +70,12 @@ class KeyboardController:
 
         Lease time always uses ``clock``; ``apply_once(now)`` independently drives
         action cooldowns so offline tests can simulate those without sleeping.
+
+        A command carrying its own ``valid_for_s`` is a positioning pulse sized
+        for one capture.  Sending an equal command again for the same
+        ``source_time`` never extends it: the earliest deadline granted for that
+        capture wins, also after the worker already expired the pulse.  A new
+        capture stamp, a different command, and unleased holds renew normally.
         """
         deadline = self._lease_deadline(source_time, valid_for_s, command_valid_for_s=cmd.valid_for_s)
         # Serialize mode changes with a complete tick, so a prior combat tick
@@ -78,8 +89,21 @@ class KeyboardController:
                 if self._navigation_only:
                     cmd = cmd.replace(face_x="none", action=cmd.action if cmd.action == "jump" else "none")
                     self._requests.clear()
+                if source_time is None or source_time != self._command_source_time:
+                    self._pulse_deadlines.clear()
+                self._command_source_time = source_time
+                if cmd.valid_for_s is not None and source_time is not None:
+                    # Command equality ignores valid_for_s, so a repeat with a
+                    # different pulse length is still the same pulse.
+                    deadline = min(deadline, self._pulse_deadlines.get(cmd, deadline))
+                    self._pulse_deadlines[cmd] = deadline
                 self.cmd = cmd
                 self._command_deadline = deadline
+
+    def _forget_capture(self) -> None:
+        """Drop same-capture pulse memory. Caller holds ``_lock``."""
+        self._command_source_time = None
+        self._pulse_deadlines.clear()
 
     def _lease_deadline(self, source_time: float | None, valid_for_s: float | None = None,
                         *, command_valid_for_s: float | None = None) -> float:
@@ -124,6 +148,7 @@ class KeyboardController:
                 self._navigation_only = False
                 self.cmd = Command.NONE
                 self._command_deadline = deadline
+                self._forget_capture()
             self.release_all()
 
     def request(self, name: str) -> None:
@@ -156,6 +181,7 @@ class KeyboardController:
                 if not self.enabled:
                     self.cmd = Command.NONE
                     self._command_deadline = None
+                    self._forget_capture()
                     self._requests.clear()
             if not self.enabled:
                 self.release_all()
@@ -262,6 +288,10 @@ class KeyboardController:
                      and self.clock() < self._command_deadline and self.is_active())
             if fresh:
                 return False
+            if not (self.enabled and self.is_active()):
+                self._forget_capture()
+            # A lease that merely ran out keeps its capture memory: the same
+            # capture must not be able to start the spent pulse a second time.
             self.cmd = Command.NONE
             self._command_deadline = None
             self._requests.clear()

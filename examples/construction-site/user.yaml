@@ -75,8 +75,30 @@ route:
     max_returns_per_lap: 1
     return_timeout_s: 60
     return_min_hp_percent: 40
+    # Regain-support stage before a return is planned from an undrawn spot (the entry
+    # pipes, a saved rope, just past a drawn end; Down alone on an undrawn rope after Left and
+    # Right both moved nothing). These are the code defaults. Offline-tested
+    # only, not live-verified; set return_regain_support to false for the old wait-then-hold.
+    return_regain_support: true
+    regain_timeout_s: 20
+    regain_max_walk_x: 16
     approach_pulse_s: 0.04
     approach_release_s: 0.45
+    # Suggested transition-timing values after the 2026-11-16 lap-3 failures (see
+    # config/default.yaml and docs/DEVELOPMENT_HANDOFF.md). Offline-tested only, NOT
+    # live-verified, so they stay commented out here. Enable one key per supervised run,
+    # commit_budget first; the last two need the far-approach keys. Leave
+    # ramp_travel_timeout_s unset (it defaults to timeout_s): one verified ramp of lap 1
+    # needed 8.4 s from its takeoff to its landing proof.
+    # commit_budget: true
+    # approach_fine_radius_x: 1.5
+    # approach_walk_speed_x: 11.0
+    # approach_stop_margin_x: 1.0
+    # approach_edge_margin_x: 1.75
+    # approach_far_pulse_max_s: 0.45
+    # approach_far_release_s: 0.3
+    # takeoff_far_approach: true
+    # recovery_far_approach: true
     enabled: true
     start_idx: 0
     loop: true

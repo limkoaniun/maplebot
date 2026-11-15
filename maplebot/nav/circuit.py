@@ -95,7 +95,18 @@ class Platform:
 
 
 class MinimapCircuit:
-    def __init__(self, cfg: dict):
+    # After a credited resume, the shortest release still served before a pulse.
+    RESUME_RELEASE_FLOOR_S = 0.15
+    # Key-up slide plus whole-pixel rounding the edge margin must cover beyond the stop margin.
+    EDGE_OVER_STOP_MARGIN_X = 0.75
+
+    def __init__(self, cfg: dict, *, far_approach: bool = True, resume_credit: bool | None = None):
+        """``far_approach=False`` ignores the opt-in far-pulse and resume-credit keys.
+
+        ``resume_credit=False`` ignores ``approach_resume_credit`` alone (a
+        return/rejoin child that may use far pulses is never interrupted by
+        combat or loot, so it has nothing to credit).
+        """
         self._cfg = deepcopy(cfg)
         self.return_on_block = bool(cfg.get("return_on_block", False))
         self.movement_test = bool(cfg.get("movement_test", False))
@@ -107,6 +118,59 @@ class MinimapCircuit:
             raise ValueError("return budget must be an integer from 1 to 3 and return timeout finite and positive")
         if not math.isfinite(self.return_min_hp_percent) or not 0 <= self.return_min_hp_percent <= 100:
             raise ValueError("return_min_hp_percent must be finite and between 0 and 100")
+        # Bounded walk-off / rope-descent stage before a return is planned from an
+        # unsupported position (maplebot/nav/regain.py). It never proves support itself.
+        self.return_regain_support = cfg.get("return_regain_support", True)
+        self.regain_timeout_s = cfg.get("regain_timeout_s", 20)
+        self.regain_max_walk_x = cfg.get("regain_max_walk_x", 16)
+        if type(self.return_regain_support) is not bool:
+            raise ValueError("return_regain_support must be true or false")
+        for name, low, high in (("regain_timeout_s", 5, 30), ("regain_max_walk_x", 4, 40)):
+            value = getattr(self, name)
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value) or not low <= value <= high):
+                raise ValueError(f"{name} must be finite and between {low} and {high}")
+            setattr(self, name, float(value))
+        self._regain = None
+        self._source_window_started = None
+        # Opt-in handling of "stably supported on a drawn platform the waypoint
+        # does not expect". Both need the saved editor plan and stay inert in
+        # movement tests, so editor connection tests and return/rejoin children
+        # never use them.
+        self.arrive_on_destination = cfg.get("arrive_on_destination", False)
+        self.platform_rejoin_enabled = cfg.get("platform_rejoin", False)
+        for name, value in (("arrive_on_destination", self.arrive_on_destination),
+                            ("platform_rejoin", self.platform_rejoin_enabled)):
+            if type(value) is not bool:
+                raise ValueError(f"{name} must be true or false")
+        self.max_platform_rejoins_per_lap = cfg.get("max_platform_rejoins_per_lap", 3)
+        self.platform_rejoin_max_transitions = cfg.get("platform_rejoin_max_transitions", 1)
+        for name, low, high in (("max_platform_rejoins_per_lap", 1, 5),
+                                ("platform_rejoin_max_transitions", 1, 4)):
+            value = getattr(self, name)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"{name} must be an integer from {low} to {high}")
+        self.platform_rejoin_timeout_s = cfg.get("platform_rejoin_timeout_s", 20)
+        if (not isinstance(self.platform_rejoin_timeout_s, (int, float))
+                or isinstance(self.platform_rejoin_timeout_s, bool)
+                or not math.isfinite(self.platform_rejoin_timeout_s)
+                or not 5 <= self.platform_rejoin_timeout_s <= 60):
+            raise ValueError("platform_rejoin_timeout_s must be finite and between 5 and 60")
+        self.platform_rejoin_timeout_s = float(self.platform_rejoin_timeout_s)
+        has_plan = isinstance(cfg.get("editor_plan"), dict)
+        if ((self.arrive_on_destination or self.platform_rejoin_enabled)
+                and not self.movement_test and not has_plan):
+            raise ValueError("arrive_on_destination and platform_rejoin need a saved editor plan")
+        self._arrive_enabled = self.arrive_on_destination and not self.movement_test and has_plan
+        self._rejoin_enabled = self.platform_rejoin_enabled and not self.movement_test and has_plan
+        self.rejoining = False
+        self.platform_rejoin = None  # child circuit while a rejoin runs
+        self.rejoin_count = 0
+        self.rejoin_state = "idle"  # idle / running / confirming / completed / failed
+        self.rejoin_reason = None
+        self.arrival_count = 0  # jump waypoints passed by destination proof, without a takeoff
+        self._rejoin_started = self._rejoin_expected = self._rejoin_failed_idx = None
+        self._reset_offroute()
         self.returning_to_start = False
         self.recovery_state = "idle"
         self.recovery_reason = self.recovery_from_index = None
@@ -154,6 +218,35 @@ class MinimapCircuit:
         self.approach_radius_x = float(cfg.get("approach_radius_x", 5))
         self.approach_pulse_s = float(cfg.get("approach_pulse_s", 0.1))
         self.approach_release_s = float(cfg.get("approach_release_s", 0.2))
+        # Optional far/fine split for walk waypoints. Absent keys keep every
+        # correction inside approach_radius_x on the vision-gated fine taps.
+        fine = cfg.get("approach_fine_radius_x") if far_approach else None
+        self.approach_fine_radius_x = None if fine is None else float(fine)
+        self.approach_walk_speed_x = float(cfg.get("approach_walk_speed_x", 0))
+        self.approach_stop_margin_x = float(cfg.get("approach_stop_margin_x", 1))
+        self.approach_edge_margin_x = float(cfg.get("approach_edge_margin_x", 1))
+        self.approach_far_pulse_max_s = float(cfg.get("approach_far_pulse_max_s", 0.4))
+        self.approach_far_release_s = float(cfg.get("approach_far_release_s", self.approach_release_s))
+        self.approach_resume_credit = (far_approach and resume_credit is not False
+                                       and bool(cfg.get("approach_resume_credit", False)))
+        # Opt-in transition timing (all OFF when absent; see config/default.yaml).
+        #   commit_budget: a transition that is physically under way is bounded by
+        #     its own budget (a fall or a rope also by a no-progress rule) instead
+        #     of the waypoint clock.
+        #   takeoff_far_approach: jump/ramp/drop/climb takeoff alignment may use the
+        #     far pulses, bounded by the SOURCE platform's end.
+        #   recovery_far_approach: return/rejoin children may use far pulses.
+        self.commit_budget = cfg.get("commit_budget", False)
+        takeoff_far = cfg.get("takeoff_far_approach", False)
+        self.recovery_far_approach = cfg.get("recovery_far_approach", False)
+        for name, value in (("commit_budget", self.commit_budget), ("takeoff_far_approach", takeoff_far),
+                            ("recovery_far_approach", self.recovery_far_approach)):
+            if type(value) is not bool:
+                raise ValueError(f"{name} must be true or false")
+            if value and name != "commit_budget" and cfg.get("approach_fine_radius_x") is None:
+                raise ValueError(f"{name} needs approach_fine_radius_x and the far approach keys")
+        # A child built without far pulses keeps fine taps for its takeoffs too.
+        self.takeoff_far_approach = takeoff_far and far_approach
         self.align_settle_s = float(cfg.get("align_settle_s", 0.25))
         self.climb_jitter_x = float(cfg.get("climb_jitter_x", 2))
         self.jump_flight_timeout_s = float(cfg.get("jump_flight_timeout_s", 2))
@@ -166,6 +259,20 @@ class MinimapCircuit:
         self.recovery_s = float(cfg.get("recovery_s", 0.8))
         self.drop_interval_s = float(cfg.get("drop_interval_s", 1))
         self.max_retries = int(cfg.get("max_retries", 2))
+        if self.commit_budget:
+            # A ramp or rope that starts at once keeps the time the waypoint clock gave
+            # it: both defaults follow timeout_s. They are clamped into their own range,
+            # so a timeout_s that is valid without the key stays valid with it.
+            for name, default, low, high in (("ramp_travel_timeout_s", min(30.0, max(2.0, self.timeout_s)), 2, 30),
+                                             ("drop_fall_timeout_s", 6.0, 2, 30),
+                                             ("climb_travel_timeout_s", min(60.0, max(2.0, self.timeout_s)), 2, 60),
+                                             ("landing_confirm_timeout_s", 3.0, 1, 10),
+                                             ("transition_stall_s", 2.0, 1, 5)):
+                value = cfg.get(name, default)
+                if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                        or not math.isfinite(value) or not low <= value <= high):
+                    raise ValueError(f"{name} must be finite and between {low} and {high}")
+                setattr(self, name, float(value))
         numbers = (self.tolerance_x, self.tolerance_y, self.align_tolerance_x, self.jump_align_tolerance_x,
                    self.drop_align_tolerance_x,
                    self.timeout_s, self.recovery_s, self.drop_interval_s,
@@ -175,6 +282,24 @@ class MinimapCircuit:
                    self.ramp_corridor_y, self.ramp_landing_s)
         if not all(math.isfinite(v) and v > 0 for v in numbers) or not 0 <= self.max_retries <= 5:
             raise ValueError("circuit tolerances/timers must be positive; max_retries must be 0 to 5")
+        if self.approach_fine_radius_x is not None:
+            far = (self.approach_fine_radius_x, self.approach_walk_speed_x, self.approach_stop_margin_x,
+                   self.approach_far_pulse_max_s, self.approach_far_release_s)
+            # The shortest far pulse must exceed a fine tap, the longest must stay
+            # well inside the 0.75 s command lease, and it always stops short.
+            if (not all(math.isfinite(v) and v > 0 for v in far)
+                    or not math.isfinite(self.approach_edge_margin_x) or self.approach_edge_margin_x < 0
+                    or not self.approach_stop_margin_x < self.approach_fine_radius_x < self.approach_radius_x
+                    or not self.approach_pulse_s <= self.approach_far_pulse_max_s <= 0.6
+                    or ((self.approach_fine_radius_x - self.approach_stop_margin_x)
+                        / self.approach_walk_speed_x < self.approach_pulse_s)):
+                raise ValueError("far approach needs stop margin < fine radius < approach radius, a positive "
+                                 "walk speed/release, and approach_pulse_s <= far pulse <= 0.6 s")
+            # A pulse sized to stop short of the waypoint can still slide and round
+            # past it; next to a platform edge the edge bound has to win first.
+            if self.approach_edge_margin_x < (self.approach_stop_margin_x
+                                              + self.EDGE_OVER_STOP_MARGIN_X - 1e-9):
+                raise ValueError("far approach needs approach_edge_margin_x >= approach_stop_margin_x + 0.75")
         if self.jump_launch_s >= self.jump_flight_timeout_s:
             raise ValueError("jump_launch_s must be shorter than jump_flight_timeout_s")
         if not math.isfinite(self.jump_landing_overshoot_x) or not 0 <= self.jump_landing_overshoot_x <= 3:
@@ -198,6 +323,10 @@ class MinimapCircuit:
         self._climb_last_y = self._climb_progress = self._climb_jump = None
         self._vertical_direction = None
         self._rejoin_floor = self._rejoin_y = self._rejoin_since = None
+        self._wall = None
+        self._suspended = False
+        self._approached = False
+        self._reset_commit()
         self._reset_alignment()
         self._reset_jump()
         self._reset_drop()
@@ -210,7 +339,7 @@ class MinimapCircuit:
 
     @property
     def transition_active(self) -> bool:
-        if self.returning_to_start:
+        if self.returning_to_start or self.rejoining:
             return True
         if self._selected and not self.completed and self.waypoints[self.idx].action in ("jump", "ramp"):
             return True
@@ -220,12 +349,65 @@ class MinimapCircuit:
         return (self._selected and self.waypoints[self.idx].action in ("climb", "drop")
                 and self.state in ("climbing", "dropping", "recovering", "dwelling", "settling"))
 
+    @property
+    def transition_committed(self) -> bool:
+        """True once the current transition can no longer be safely interrupted.
+
+        Committed: a return to start, a blocked/terminal route, every climb state
+        that ``transition_active`` covers (settling already holds Up under the
+        rope), a jump from its takeoff key until landing proof and during the
+        rest after a failed flight, a ramp once it left its takeoff point or
+        waits out a knockback, and a drop from its Down+Jump until it is seen
+        back on the source floor re-aligning. Only the pre-takeoff phases are
+        uncommitted: waiting for the takeoff floor, lining up, settling, and
+        re-aligning after a failed attempt. Anything unlisted is committed.
+        """
+        if self.returning_to_start or self.recovery_terminal or self.rejoining:
+            return True
+        if not self.transition_active:
+            return False
+        if self.completed or self.reason is not None:
+            return True
+        action = self.waypoints[self.idx].action
+        if action == "jump":
+            return self._jump_phase != "align"
+        if action == "ramp":
+            return self._ramp_started or self._ramp_retry_since is not None
+        if action == "drop":
+            # ``state`` is the last stepped frame's: the frame after a failed
+            # attempt or a lost position stays committed until it is re-stepped.
+            return (self._drop_launched_at is not None or self._drop_departed
+                    or self.state not in ("aligning", "settling"))
+        return True
+
+    def takeoff_interruptible(self, pos) -> bool:
+        """``not transition_committed`` checked against a fresh position.
+
+        The property only knows the last stepped frame. A character knocked off
+        a drop ledge since then is already falling, so a drop additionally needs
+        the same source-floor height its own takeoff test requires.
+        """
+        if pos is None or not self.transition_active or self.transition_committed:
+            return False
+        if self.waypoints[self.idx].action == "drop":
+            return self._drop_source_y is not None and abs(pos[1] - self._drop_source_y) <= 1
+        return True
+
     def suspend(self, now: float) -> None:
         self._clock.update(now, False)
         self._reset_return_stability()
         if self.recovery is not None and self.returning_to_start:
             self.recovery.suspend(now)
+        if self._regain is not None and self.returning_to_start:
+            self._regain.interrupt()
+        if self.platform_rejoin is not None and self.rejoining:
+            self.platform_rejoin.suspend(now)
+        self._reset_offroute()
+        # Only the first suspend of an uninterrupted run measures the release
+        # already served; later ones neither add to it nor restart it.
+        credit = self._resume_credit if self._suspended else self._suspend_credit(now)
         self._reset_alignment()
+        self._resume_credit, self._suspended = credit, True
         self._rejoin_floor = self._rejoin_y = self._rejoin_since = None
         self._jump_landing_since = self._jump_landing_y = None
         self._jump_landing_frames = 0
@@ -302,24 +484,154 @@ class MinimapCircuit:
 
     def _reset_alignment(self) -> None:
         self._aligned_since = None
+        self._reset_pulse()
+        self._resume_credit = None
+
+    def _reset_pulse(self) -> None:
         self._pulse_until = None
         self._pulse_direction = None
         self._pulse_on = False
+        self._pulse_far = False
+        self._release_since = None
+        self._pulse_dx = None
+        self._credit_dx = None
 
-    def _precision_approach(self, dx: float, now: float) -> Command:
+    def _suspend_credit(self, now: float):
+        """(wall time, direction, dx, release already served) when keys were last ours."""
+        if not self.approach_resume_credit or self._pulse_until is None or self._release_since is None:
+            return None
+        served = 0.0 if self._pulse_on else max(0.0, self._clock.time - self._release_since)
+        return now, self._pulse_direction, self._pulse_dx, served
+
+    def _resume_release(self, release: float, direction: str, dx: float) -> float:
+        """Remaining release after an interruption that visibly did not move the player."""
+        credit, self._resume_credit = self._resume_credit, None
+        if (credit is None or self._wall is None or credit[1] != direction or credit[2] is None
+                or abs(dx - credit[2]) > 0.5 or not self._wall >= credit[0]):
+            return release
+        # One same-pixel observation is not proof of standing still: part of the
+        # release is always served again, and _precision_approach restarts it in
+        # full if the next observations show the player moving.
+        self._credit_dx = dx
+        return max(min(release, self.RESUME_RELEASE_FLOOR_S),
+                   release - credit[3] - (self._wall - credit[0]))
+
+    def _walk_room(self, point: Waypoint, pos, dx: float) -> float | None:
+        """Floor left ahead on the waypoint's platform; None forbids far pulses."""
+        if self.approach_fine_radius_x is None or point.action != "walk":
+            return None
+        if not self.platforms:
+            return math.inf
+        platform = self._containing_platform((point.x, point.y))
+        if platform is None:
+            return None
+        return pos[0] - platform.left if dx < 0 else platform.right - pos[0]
+
+    def _takeoff_room(self, source: Platform | None, pos, dx: float) -> float | None:
+        """Floor beyond the takeoff point on its SOURCE platform; None keeps the fine taps.
+
+        Only with ``takeoff_far_approach`` and a fresh position strictly on the
+        known source surface. The takeoff tolerance, the settle on aligned
+        frames and every support test stay with the caller, unchanged.
+
+        The room is measured from the takeoff point (``pos[0] + dx``), not from
+        the player. A pulse is sized before the next frame can see a knock-back;
+        sized this way it is short enough to stop the edge margin before the
+        platform end even when the knock puts the character onto the takeoff
+        point as the pulse starts. A takeoff closer to that end than the margin
+        plus one fine tap (the gap jumps, 2 px from the gap) therefore keeps
+        fine taps in that direction.
+        """
+        if (not self.takeoff_far_approach or not self.platforms or source is None
+                or not source.left <= pos[0] <= source.right
+                or source.support_error(pos) > min(1.0, self.tolerance_y)):
+            return None
+        target_x = pos[0] + dx
+        return target_x - source.left if dx < 0 else source.right - target_x
+
+    def _previous_walk_platform(self) -> Platform | None:
+        previous = self.waypoints[(self.idx - 1) % len(self.waypoints)]
+        return self._containing_platform((previous.x, previous.y)) if previous.action == "walk" else None
+
+    # --- commit_budget: a transition under way is not charged to the waypoint clock ---
+    def _reset_commit(self) -> None:
+        self._commit_started = self._commit_progress_at = self._commit_best = None
+        self._climb_commit_spent = 0.0
+
+    def _commit_begin(self, now: float, best: float = 0.0) -> None:
+        """``best`` is the progress measure a fall or rope starts from; a ramp has none."""
+        if self._commit_started is None:
+            self._commit_started = self._commit_progress_at = now
+            self._commit_best = best
+
+    def _commit_progress(self, now: float, value: float, proving: bool = False) -> None:
+        """One more whole pixel toward the destination, or a running landing proof."""
+        if value >= self._commit_best + 1:
+            self._commit_best, self._commit_progress_at = value, now
+        elif proving:
+            self._commit_progress_at = now
+
+    def _commit_end(self, now: float, credit: bool = True) -> None:
+        """Back before a takeoff: the committed time is credited, never the time before it.
+
+        ``credit=False`` leaves that time on the waypoint clock: nothing took off after all.
+        Every credited end is bounded in number (takeoffs, retries, ever lower ledges).
+        """
+        if self._commit_started is not None:
+            if credit:
+                self._started += now - self._commit_started
+            self._commit_started = self._commit_progress_at = self._commit_best = None
+
+    def _precision_approach(self, dx: float, now: float, room: float | None = None) -> Command:
         """Release before small corrections so momentum and capture lag can settle."""
         direction = "left" if dx < 0 else "right"
         self._aligned_since = None
+        self._approached = True
         if abs(dx) > self.approach_radius_x:
             self._reset_alignment()
             return Command(direction)
+        release, pulse, far = self.approach_release_s, self.approach_pulse_s, False
+        if room is not None and abs(dx) > self.approach_fine_radius_x:
+            # One keyboard-enforced pulse sized from the remaining distance at a
+            # conservative (upper-bound) speed. It stops short of the target and
+            # of the platform edge, so its length does not depend on frame rate.
+            planned = min(min(abs(dx) - self.approach_stop_margin_x, room - self.approach_edge_margin_x)
+                          / self.approach_walk_speed_x, self.approach_far_pulse_max_s)
+            if planned >= self.approach_pulse_s:
+                release, pulse, far = self.approach_far_release_s, planned, True
         if self._pulse_until is None or self._pulse_direction != direction:
             self._pulse_direction = direction
             self._pulse_on = False
-            self._pulse_until = now + self.approach_release_s
+            self._release_since = now
+            self._pulse_until = now + self._resume_release(release, direction, dx)
+        elif self._credit_dx is not None and abs(dx - self._credit_dx) > 0.5:
+            # Moved after a credited resume: the credit was wrong, release in full.
+            self._credit_dx = None
+            self._pulse_on = False
+            self._release_since = now
+            self._pulse_until = now + release
+        elif far != self._pulse_far:
+            # Crossing the far/fine boundary never carries a pulse across it.
+            if self._pulse_on or self._release_since is None:
+                self._release_since = now
+            self._pulse_on = False
+            self._pulse_until = self._release_since + release
         elif now >= self._pulse_until:
             self._pulse_on = not self._pulse_on
-            self._pulse_until = now + (self.approach_pulse_s if self._pulse_on else self.approach_release_s)
+            if self._pulse_on:
+                self._pulse_until = now + pulse
+            else:
+                # The keyboard released a far pulse at its deadline, not at this frame.
+                self._release_since = self._pulse_until if far else now
+                self._pulse_until = self._release_since + release
+                if far and now >= self._pulse_until:
+                    self._pulse_on = True
+                    self._pulse_until = now + pulse
+        elif far and self._pulse_on:
+            self._pulse_until = min(self._pulse_until, now + pulse)  # fresh frames may only shorten it
+        self._pulse_far, self._pulse_dx = far, dx
+        if self._pulse_on:
+            self._credit_dx = None
         # The keyboard must end a short correction even if the next vision frame
         # arrives late. Repeated decisions retain only this pulse's remaining time.
         return (Command(direction, valid_for_s=self._pulse_until - now)
@@ -328,6 +640,7 @@ class MinimapCircuit:
     def _advance(self, now: float) -> None:
         if self.idx == len(self.waypoints) - 1:
             self.return_count = 0  # only completing the original lap replenishes its return budget
+            self.rejoin_count = 0
         if not self.loop and self.idx == len(self.waypoints) - 1:
             self.completed = True
             self.state = "completed"
@@ -343,6 +656,9 @@ class MinimapCircuit:
         self._vertical_direction = None
         self.reason = None
         self._rejoin_floor = self._rejoin_y = self._rejoin_since = None
+        self._rejoin_failed_idx = None  # at most one failed rejoin per waypoint selection
+        self._reset_offroute()
+        self._reset_commit()
         self._reset_alignment()
         self._reset_jump()
         self._reset_drop()
@@ -396,6 +712,8 @@ class MinimapCircuit:
             self._reset_alignment()
             self._reset_ramp_retry_stability()
             self.state = "ramp_realigning"
+            if self.commit_budget:
+                self._commit_end(now)  # the pre-takeoff clock resumes where the takeoff left it
         # The next fresh observation uses the ordinary precision approach. The
         # original ramp timeout and the one-retry budget are never replenished.
         return Command.NONE
@@ -406,7 +724,8 @@ class MinimapCircuit:
         if self.reason is not None:
             self.state = "blocked"
             return Command.NONE
-        if now - self._started >= self.timeout_s:
+        committed = self.commit_budget and self._commit_started is not None
+        if not committed and now - self._started >= self.timeout_s:
             self.reason, self.state = "ramp timeout", "blocked"
             return Command.NONE
         landing_tolerance = min(1.0, self.tolerance_y)
@@ -420,11 +739,17 @@ class MinimapCircuit:
                 self._reset_alignment()
                 self._ramp_source_y = None
                 self.state = "ramp_waiting_floor"
+                meta = self._wp_meta(self.idx)
+                if self._platform_rejoin_due(pos, now, meta.get("from_platform"),
+                                             (meta.get("to_platform"),)):
+                    self._begin_platform_rejoin(pos, now, meta.get("from_platform"))
                 return Command.NONE
+            self._reset_offroute()
             dx = point.from_x - pos[0]
             if abs(dx) > max(self.align_tolerance_x, self.tolerance_x):
                 self.state = "ramp_aligning"
-                return self._precision_approach(dx, now)
+                return self._precision_approach(dx, now, self._takeoff_room(source, pos, dx)
+                                                if self.takeoff_far_approach else None)
             self._pulse_until = self._pulse_direction = None
             if self._ramp_source_y is None or abs(pos[1] - self._ramp_source_y) > 0.5:
                 self._aligned_since = None
@@ -435,6 +760,9 @@ class MinimapCircuit:
                 self.state = "ramp_settling"
                 return Command.NONE
             self._ramp_started = True
+            if self.commit_budget:
+                self._commit_begin(now)
+                committed = True
 
         low_x, high_x = sorted((point.from_x, point.x))
         fraction = (pos[0] - point.from_x) / (point.x - point.from_x)
@@ -475,6 +803,16 @@ class MinimapCircuit:
         # stable height must still persist throughout the landing confirmation.
         arrived = supported and (abs(pos[0] - point.x) <= self.tolerance_x
                                  or landed_beyond or on_reached_floor)
+        if committed:
+            # Bounded from the takeoff alone; a running landing proof gets its dwell on
+            # top. There is deliberately no no-progress rule here: a verified lap stood
+            # 5 s on the first stair pixel with the key held and then walked up
+            # (log/claude-circuits-6.jsonl, lap 1, waypoint 22). The corridor and
+            # support checks above already end every ramp that leaves its stair.
+            budget = self.ramp_travel_timeout_s + (max(self.ramp_landing_s, point.dwell_s) if arrived else 0)
+            if now - self._commit_started >= budget:
+                self.reason, self.state = "ramp timeout", "blocked"
+                return Command.NONE
         if arrived:
             self._ramp_destination_seen = True
             if (self._ramp_landing_pos is None
@@ -511,7 +849,8 @@ class MinimapCircuit:
         if self.reason is not None:
             self.state = "blocked"
             return Command.NONE
-        if now - self._started >= self.timeout_s:
+        committed = self.commit_budget and self._commit_started is not None
+        if not committed and now - self._started >= self.timeout_s:
             return self._block_drop("drop timeout")
         landing_tolerance = min(1.0, self.tolerance_y)
         destination_y = self._height_at(point.x, point.y, pos[0])
@@ -537,17 +876,31 @@ class MinimapCircuit:
         destination = self._containing_platform((point.x, point.y))
         at_destination = (self._support_error(point.x, point.y, pos) <= landing_tolerance
                           and (destination is None or destination.left <= pos[0] <= destination.right))
+        if committed:
+            # From the launch (or an observed departure) the fall has its own budget;
+            # the landing proof gets its dwell on top and counts as progress.
+            self._commit_progress(now, pos[1], at_destination)
+            budget = self.drop_fall_timeout_s + (max(0.25, point.dwell_s) if at_destination else 0)
+            if now - self._commit_started >= budget:
+                return self._block_drop("drop timeout")
         if at_destination:
             self._drop_started = self._drop_launch_ended = True
             self.state = "dwelling"
             if stable_for < max(0.25, point.dwell_s):
                 return Command.NONE
+            if committed:
+                # Landing proven: the correction on the destination floor runs on
+                # the waypoint clock again, credited with the committed time.
+                self._commit_end(now)
             if abs(dx) <= self.tolerance_x:
                 self._advance(now)
                 return Command.NONE
             # Horizontal correction is allowed only after a stable destination landing.
             return self._precision_approach(dx, now)
         if pos[1] > self._drop_source_y + 1:
+            if self.commit_budget and not self._drop_departed and not committed:
+                self._commit_begin(now, pos[1])  # also a fall nobody launched (knocked off)
+                committed = True
             self._drop_departed = self._drop_started = self._drop_launch_ended = True
         elif pos[1] < self._drop_source_y - 1:
             self._drop_launch_ended = True  # Down+Jump may jump upward on a solid ledge
@@ -562,8 +915,16 @@ class MinimapCircuit:
                 self._drop_departed = False
                 self.retries = 0
                 self._reset_alignment()
+                if committed:
+                    self._commit_end(now)  # a new takeoff from this lower ledge
             elif stable_for >= max(0.4, self.align_settle_s) and abs(pos[1] - self._drop_source_y) <= 1:
                 self._drop_departed = False  # returning to the same floor does not reset its retry budget
+                if committed and self._drop_launched_at is None:
+                    # Nobody launched and nothing fell: a dip that came back was pre-takeoff
+                    # time. Credited, repeated dips would postpone "drop timeout" without a count.
+                    self._commit_end(now, credit=False)
+            elif committed and now - self._commit_progress_at >= self.transition_stall_s:
+                return self._block_drop("drop stalled")
             return Command.NONE
         if self._drop_launched_at is not None:
             self.state = "dropping"
@@ -578,13 +939,16 @@ class MinimapCircuit:
                 self.retries += 1
                 self._drop_launched_at = None
                 self._reset_alignment()
+                if committed:
+                    self._commit_end(now)  # never left the floor: re-aligning is pre-takeoff time
             return Command.NONE
         if abs(pos[1] - self._drop_source_y) > 1:
             self.state = "dropping"
             return Command.NONE
         if abs(dx) > self.drop_align_tolerance_x:
             self.state = "aligning"
-            return self._precision_approach(dx, now)
+            return self._precision_approach(dx, now, self._takeoff_room(self._previous_walk_platform(), pos, dx)
+                                            if self.takeoff_far_approach else None)
         self._pulse_until = self._pulse_direction = None
         if self._aligned_since is None:
             self._aligned_since = now
@@ -595,6 +959,8 @@ class MinimapCircuit:
         self._drop_launched_at = now
         self._drop_launch_ended = False
         self.state = "dropping"
+        if self.commit_budget:
+            self._commit_begin(now, pos[1])
         return Command("none", "down", "jump")
 
     def _reset_jump(self) -> None:
@@ -620,6 +986,73 @@ class MinimapCircuit:
             self.state = "jump_retry"
         return Command.NONE
 
+    def _off_jump_source(self, pos, point) -> bool:
+        source = self._containing_platform((point.from_x, point.from_y))
+        return (self._support_error(point.from_x, point.from_y, pos) > min(1.0, self.tolerance_y)
+                or (source is not None and not source.left <= pos[0] <= source.right))
+
+    def _step_jump_arrival(self, pos, now: float, point, direction: str) -> Command | None:
+        """Accept a jump whose destination already supports the character.
+
+        A knock-back can carry the character across a narrow gap before the
+        takeoff. This never presses Jump: it proves strict support on the
+        connection's saved destination platform over fresh frames, walks to the
+        landing X like a short landing does, then requires the strictest landing
+        dwell the flight uses. ``None`` leaves the frame to the ordinary code.
+        """
+        to_id = self._wp_meta(self.idx).get("to_platform")
+        destination = self._containing_platform((point.x, point.y))
+        # The entry proof needs the destination to be the ONE strict support. After
+        # it passed, a column where a stair toe overlaps the same floor is still
+        # the destination: its own saved surface must keep the strict 0.75 support.
+        strict = (self._strict_platform_id(pos) == to_id if self._jump_phase == "align"
+                  else self._plan_platform_supports(to_id, pos))
+        on_destination = (to_id is not None and destination is not None
+                          and destination.left <= pos[0] <= destination.right
+                          and self._support_error(point.x, point.y, pos) <= min(1.0, self.tolerance_y)
+                          and strict)
+        if self._jump_phase == "align":
+            if not on_destination or not self._off_jump_source(pos, point):
+                return None
+            self.state = "jump_arrived_checking"
+            self._reset_alignment()
+            if self._offroute_stable(pos, to_id, now):
+                self._reset_offroute()
+                self._jump_phase = "arrived"
+                self._jump_landing_since = self._jump_landing_y = None
+                self._jump_landing_frames = 0
+                self._jump_destination_seen = False
+            return Command.NONE
+        if not on_destination:
+            # Support was lost before the proof finished: nothing is latched.
+            self._reset_jump()
+            self._reset_alignment()
+            self._reset_offroute()
+            self.state = "jump_waiting_floor"
+            return Command.NONE
+        forward_overshoot = (pos[0] - point.x) * (1 if direction == "right" else -1)
+        in_window = (abs(point.x - pos[0]) <= self.tolerance_x
+                     or (direction != "none" and 0 < forward_overshoot <= self.jump_landing_overshoot_x)
+                     or self._jump_destination_seen)
+        if not in_window:
+            self._jump_landing_since = self._jump_landing_y = None
+            self._jump_landing_frames = 0
+            self.state = "jump_arrived_aligning"
+            return self._precision_approach(point.x - pos[0], now)
+        self._jump_destination_seen = True
+        if self._jump_landing_since is None or abs(pos[1] - self._jump_landing_y) > 0.5:
+            self._jump_landing_since, self._jump_landing_y = now, pos[1]
+            self._jump_landing_frames = 1
+        else:
+            self._jump_landing_frames += 1
+        self.state = "jump_arrived"
+        # No descent was observed, so the longest landing confirmation applies.
+        if (self._jump_landing_frames >= 3
+                and now - self._jump_landing_since >= max(self.jump_landing_s, point.dwell_s, 0.65)):
+            self.arrival_count += 1
+            self._advance(now)
+        return Command.NONE
+
     def _step_jump(self, pos, now: float) -> Command:
         point = self.waypoints[self.idx]
         if self.reason is not None:
@@ -631,20 +1064,32 @@ class MinimapCircuit:
                 return Command.NONE
             self._jump_phase = "align"
             self._started = now
-        if now - self._started >= self.timeout_s:
+        # commit_budget: a flight ends by its own flight / landing-confirmation
+        # bounds below, never by a waypoint clock that alignment already spent.
+        if (not (self.commit_budget and self._jump_phase == "flight")
+                and now - self._started >= self.timeout_s):
             return self._jump_failed(now)
         direction = "left" if point.x < point.from_x else "right" if point.x > point.from_x else "none"
+        if self._arrive_enabled and self._jump_phase in ("align", "arrived"):
+            arrival = self._step_jump_arrival(pos, now, point, direction)
+            if arrival is not None:
+                return arrival
         if self._jump_phase == "align":
-            source = self._containing_platform((point.from_x, point.from_y))
-            if (self._support_error(point.from_x, point.from_y, pos) > min(1.0, self.tolerance_y)
-                    or (source is not None and not source.left <= pos[0] <= source.right)):
+            if self._off_jump_source(pos, point):
                 self._reset_alignment()
                 self.state = "jump_waiting_floor"
+                meta = self._wp_meta(self.idx)
+                if self._platform_rejoin_due(pos, now, meta.get("from_platform"),
+                                             (meta.get("to_platform"),)):
+                    self._begin_platform_rejoin(pos, now, meta.get("from_platform"))
                 return Command.NONE
+            self._reset_offroute()
             dx = point.from_x - pos[0]
             if abs(dx) > self.jump_align_tolerance_x:
                 self.state = "jump_aligning"
-                return self._precision_approach(dx, now)
+                return self._precision_approach(dx, now, self._takeoff_room(
+                    self._containing_platform((point.from_x, point.from_y)), pos, dx)
+                    if self.takeoff_far_approach else None)
             self._pulse_until = self._pulse_direction = None
             if self._jump_takeoff_y is None or abs(pos[1] - self._jump_takeoff_y) > 0.5:
                 self._aligned_since = None
@@ -690,6 +1135,9 @@ class MinimapCircuit:
             self.state = "jump_landing" if self._jump_descending else "airborne"
             required_dwell = max(self.jump_landing_s, point.dwell_s,
                                  0 if self._jump_descending else 0.65)
+            if (self.commit_budget and flight_s >= self.jump_flight_timeout_s
+                    + self.landing_confirm_timeout_s + required_dwell):
+                return self._jump_failed(now)  # a landing that never holds still
             if (self._jump_landing_frames >= 3
                     and now - self._jump_landing_since >= required_dwell
                     and (self._jump_descending or flight_s >= 0.8)):
@@ -715,6 +1163,202 @@ class MinimapCircuit:
                 direction = "left"
         return Command(direction)
 
+    def _climb_commit(self, point, pos, dx: float, reached_y: bool, t: float) -> tuple[bool, bool]:
+        """(on the rope, budget spent or stalled) from minimap height alone.
+
+        On the rope means: under the rope's X, more than ``tolerance_y`` from
+        the previous walk waypoint's floor toward the destination, destination
+        height not reached. The screen-space ladder flag is never consulted.
+        Rope time is cumulative per waypoint selection, so leaving and
+        re-entering the rope cannot extend it.
+        """
+        previous = self.waypoints[(self.idx - 1) % len(self.waypoints)]
+        on_rope, travelled = False, 0.0
+        if previous.action == "walk":
+            floor = self._height_at(previous.x, previous.y, pos[0])
+            travelled = (floor - pos[1]) * (1 if point.y < floor else -1)
+            on_rope = (floor != point.y and abs(dx) < self.climb_jitter_x
+                       and travelled > self.tolerance_y and not reached_y)
+        if not on_rope:
+            if self._commit_started is not None:
+                self._climb_commit_spent += t - self._commit_started
+                self._commit_end(t)
+            return False, False
+        self._commit_begin(t, travelled)
+        self._commit_progress(t, travelled)
+        if (self._climb_commit_spent + t - self._commit_started >= self.climb_travel_timeout_s
+                or t - self._commit_progress_at >= self.transition_stall_s):
+            # The ordinary timeout branch (retry rest or "waypoint timeout") takes over.
+            self._climb_commit_spent += t - self._commit_started
+            self._commit_end(t)
+            return True, True
+        return True, False
+
+    def _reset_offroute(self) -> None:
+        self._off_pos = self._off_id = self._off_since = None
+        self._off_frames = 0
+
+    def _offroute_stable(self, pos, platform_id, t: float) -> bool:
+        """Three fresh stepped frames, half a second, half a pixel, one strict platform."""
+        if (self._off_pos is None or self._off_id != platform_id
+                or max(abs(pos[i] - self._off_pos[i]) for i in (0, 1)) > .5):
+            self._off_pos, self._off_id, self._off_since = pos, platform_id, t
+            self._off_frames = 1
+        else:
+            self._off_frames += 1
+        return self._off_frames >= 3 and t - self._off_since >= .5
+
+    def _strict_platform_id(self, pos):
+        """The one drawn platform supporting ``pos``; None when unsupported or ambiguous."""
+        from maplebot.nav.recovery import supported_platform
+
+        try:
+            return supported_platform(self._cfg, pos)["id"]
+        except ValueError:
+            return None
+
+    def _plan_platform_supports(self, platform_id, pos) -> bool:
+        """The saved platform ``platform_id`` itself supports ``pos`` by the strict rule."""
+        for item in (self._cfg.get("editor_plan") or {}).get("platforms", ()):
+            if item.get("id") == platform_id:
+                surface = Platform(item["y"], item["left"], item["right"],
+                                   item.get("right_y"), item.get("knots", ()))
+                return surface.left <= pos[0] <= surface.right and surface.support_error(pos) <= .75
+        return False
+
+    def _wp_meta(self, idx: int) -> dict:
+        return self._cfg["waypoints"][idx]
+
+    def _arrival_jump_index(self, pos, expected_id):
+        """The jump this walk leads to, when the character already stands on its destination.
+
+        Only walk waypoints on ``expected_id`` may lie between the current
+        waypoint and a jump that takes off from ``expected_id`` and lands on the
+        one platform strictly supporting ``pos``. Returns (index, platform id).
+        """
+        if not self._arrive_enabled or self.reason is not None or expected_id is None:
+            return None
+        current = self._strict_platform_id(pos)
+        if current is None or current == expected_id:
+            return None
+        for idx in range(self.idx + 1, len(self.waypoints)):
+            meta, action = self._wp_meta(idx), self.waypoints[idx].action
+            if action == "walk" and meta.get("platform_id") == expected_id:
+                continue
+            if (action == "jump" and meta.get("from_platform") == expected_id
+                    and meta.get("to_platform") == current):
+                return idx, current
+            break
+        return None
+
+    def _platform_rejoin_due(self, pos, t: float, expected_id, exclude=()) -> bool:
+        """Stably supported on a drawn platform other than the one this waypoint needs."""
+        if (not self._rejoin_enabled or self.returning_to_start or self.reason is not None
+                or self.rejoin_count >= self.max_platform_rejoins_per_lap
+                or self.idx == self._rejoin_failed_idx or expected_id is None):
+            self._reset_offroute()
+            return False
+        current = self._strict_platform_id(pos)
+        if current is None or current == expected_id or current in exclude:
+            self._reset_offroute()
+            return False
+        return self._offroute_stable(pos, current, t)
+
+    def _begin_platform_rejoin(self, pos, t: float, expected_id) -> bool:
+        """Plan the saved path back; no input this frame and no index change ever."""
+        from maplebot.nav.recovery import plan_rejoin
+
+        self._reset_offroute()
+        try:
+            child = MinimapCircuit(plan_rejoin(self._cfg, pos, self.idx,
+                                               self.platform_rejoin_max_transitions),
+                                   far_approach=self.recovery_far_approach, resume_credit=False)
+        except ValueError as exc:
+            # Unplannable: latch for this waypoint, spend nothing, keep waiting as before.
+            self._rejoin_failed_idx = self.idx
+            self.rejoin_state, self.rejoin_reason = "failed", str(exc)
+            return False
+        self.platform_rejoin = child
+        self.rejoining = True
+        self.rejoin_count += 1
+        self._rejoin_started, self._rejoin_expected = t, expected_id
+        self.rejoin_state, self.rejoin_reason = "running", None
+        self.state = "rejoin_starting"
+        self._reset_alignment()
+        return True
+
+    def _finish_platform_rejoin(self, ok: bool, reason=None, t=None) -> Command:
+        if self.platform_rejoin is not None:
+            self.platform_rejoin.suspend(self._clock.last if self._clock.last is not None else 0)
+        self.rejoining = False
+        self.platform_rejoin = None
+        self._rejoin_started = self._rejoin_expected = None
+        self._reset_offroute()
+        self._reset_alignment()
+        if ok:
+            # Physically back on the expected platform: the same waypoint goes on
+            # with a fresh timeout window. Index and retries are not touched.
+            self.rejoin_state, self.rejoin_reason = "completed", None
+            self.state = "rejoined"
+            self._started = t
+            self._arrived = None
+            self._jump_takeoff_y = self._ramp_source_y = None
+        else:
+            # Not a block: off the expected platform the waypoint keeps its own clock,
+            # so the ordinary timeout, block and return/Hold follow as without a rejoin.
+            self.rejoin_state, self.rejoin_reason = "failed", str(reason)
+            self._rejoin_failed_idx = self.idx
+            self.state = "rejoin_failed"
+            if t is not None:
+                # The last fresh frame stood strictly on the expected platform. The
+                # rejoin's own time must not expire the waypoint there (no stuck-recovery
+                # jump, no spent retry); retries and the per-waypoint latch are kept.
+                self._started = t
+                self._arrived = None
+                self._jump_takeoff_y = self._ramp_source_y = None
+        return Command.NONE
+
+    def cancel_platform_rejoin(self, reason: str) -> None:
+        """End an active rejoin without success (map/settings change, superseding return)."""
+        if self.rejoining:
+            self._finish_platform_rejoin(False, reason)
+
+    def _step_platform_rejoin(self, pos, now: float, on_ladder: bool) -> Command:
+        t = self._clock.update(now, pos is not None)
+        child = self.platform_rejoin
+        if pos is None:
+            child.suspend(now)
+            self._reset_offroute()
+            self.state = "rejoin_waiting_position"
+            return Command.NONE
+        timed_out = t - self._rejoin_started >= self.platform_rejoin_timeout_s
+        current = self._strict_platform_id(pos)
+        if current == self._rejoin_expected and (child.completed or not child.transition_committed):
+            # The child's index is not proof: confirm the expected platform itself.
+            child.suspend(now)
+            self.rejoin_state = "confirming"
+            self.state = "rejoin_confirming"
+            if self._offroute_stable(pos, current, t):
+                return self._finish_platform_rejoin(True, t=t)
+            if timed_out:
+                return self._finish_platform_rejoin(False, "Rejoin timed out", t=t)
+            return Command.NONE
+        self._reset_offroute()
+        self.rejoin_state = "running"
+        if child.completed:
+            return self._finish_platform_rejoin(False, "Left the waypoint platform before confirmation")
+        if timed_out and not child.transition_committed:
+            # A committed flight, ramp or rope is never cut: it ends by its own
+            # bounded proof or block, and the rejoin fails on the next free frame.
+            return self._finish_platform_rejoin(False, "Rejoin timed out")
+        command = child.step(pos, now, on_ladder)
+        self.state = "rejoin_" + child.state
+        if child.state == "blocked":
+            return self._finish_platform_rejoin(
+                False, child.reason or "Rejoin route blocked",
+                t=t if current == self._rejoin_expected else None)
+        return command
+
     def _reset_return_stability(self) -> None:
         self._return_stable_since = self._return_stable_pos = self._return_platform_id = None
         self._return_stable_frames = 0
@@ -723,6 +1367,7 @@ class MinimapCircuit:
         """Queue a guarded return; no original index changes and no immediate input."""
         if self.returning_to_start or self.recovery_terminal or self.movement_test:
             return False
+        self.cancel_platform_rejoin("Superseded by return to point 1")
         self.recovery_from_index = self.idx
         self.blocked_origin_reason = self.reason if self.state == "blocked" else None
         if self.return_count >= self.max_returns_per_lap:
@@ -737,12 +1382,15 @@ class MinimapCircuit:
         self.recovery_reason = None
         self.recovery = None
         self._return_started = None
+        self._regain = None
+        self._source_window_started = None
         self._reset_return_stability()
         self.state = "return_waiting_source"
         return True
 
     def abort_return_to_start(self, reason: str) -> None:
         """Make a return failure terminal until an explicit configuration reload."""
+        self.cancel_platform_rejoin(str(reason))
         self.returning_to_start = False
         self.recovery_terminal = True
         self.recovery_state = "failed"
@@ -764,8 +1412,27 @@ class MinimapCircuit:
             self._return_stable_frames += 1
         return self._return_stable_frames >= 3 and now - self._return_stable_since >= .5
 
+    def _step_regain(self, pos, t: float, now: float) -> Command:
+        """One unsupported fresh frame of the bounded regain-support stage."""
+        from maplebot.nav.regain import SupportRegain
+
+        if self._regain is None:
+            self._regain = SupportRegain(self._cfg, timeout_s=self.regain_timeout_s,
+                                         max_walk_x=self.regain_max_walk_x)
+        command = self._regain.step(pos, t, now)
+        # The stable-source window restarts while the stage works; the stage has
+        # its own budgets and the whole return keeps return_timeout_s.
+        self._source_window_started = t
+        if self._regain.failed:
+            self.abort_return_to_start(self._regain.reason)
+            return Command.NONE
+        self.recovery_state = "regaining_support"
+        self.state = "return_regain_" + self._regain.phase
+        self.recovery_reason = self._regain.detail
+        return command
+
     def _step_return(self, pos, now: float, on_ladder: bool) -> Command:
-        from maplebot.nav.recovery import plan_return_to_start, supported_platform
+        from maplebot.nav.recovery import UnsupportedPosition, plan_return_to_start, supported_platform
 
         t = self._clock.update(now, pos is not None)
         if self._return_started is None:
@@ -777,22 +1444,44 @@ class MinimapCircuit:
             self._reset_return_stability()
             if self.recovery is not None:
                 self.recovery.suspend(now)
+            if self._regain is not None:
+                self._regain.interrupt(fresh_deadline=False)
             return Command.NONE
         if self.recovery is None:
-            if t - self._return_started >= 3:
+            if self._source_window_started is None:
+                self._source_window_started = self._return_started
+            if t - self._source_window_started >= 3:
                 self.abort_return_to_start("Stable source unavailable: " + (self.recovery_reason or "position kept moving"))
                 return Command.NONE
             try:
                 source = supported_platform(self._cfg, pos)
+            except UnsupportedPosition as exc:
+                if not self.return_regain_support:
+                    self.recovery_reason = str(exc)
+                    self._reset_return_stability()
+                    return Command.NONE
+                self._reset_return_stability()
+                return self._step_regain(pos, t, now)
             except ValueError as exc:
                 self.recovery_reason = str(exc)
                 self._reset_return_stability()
                 return Command.NONE
+            if self._regain is not None:
+                # Supported: the stage goes quiet and proves nothing. A flickering
+                # source does not get a new settle deadline each time.
+                self._regain.interrupt(fresh_deadline=False)
+            if self.recovery_state == "regaining_support":
+                self.recovery_state = "waiting_source"
+                self.state = "return_waiting_source"
             self.recovery_reason = None
             if not self._return_position_stable(pos, source["id"], t):
                 return Command.NONE
             try:
-                self.recovery = MinimapCircuit(plan_return_to_start(self._cfg, pos))
+                # The return route ends at connection take-offs and is not the lap the
+                # opt-in far pulses were tuned on: it keeps the vision-gated fine taps
+                # unless recovery_far_approach opts in. It never uses resume credit.
+                self.recovery = MinimapCircuit(plan_return_to_start(self._cfg, pos),
+                                               far_approach=self.recovery_far_approach, resume_credit=False)
             except ValueError as exc:
                 self.abort_return_to_start(str(exc))
                 return Command.NONE
@@ -828,11 +1517,26 @@ class MinimapCircuit:
         return Command.NONE
 
     def step(self, pos: tuple[int, int] | None, now: float, on_ladder: bool = False) -> Command:
+        self._wall, self._suspended = now, False
+        self._approached = False
+        try:
+            return self._step(pos, now, on_ladder)
+        finally:
+            self._resume_credit = None  # release credit is for the first step after a suspend only
+            if not self._approached and (self.approach_fine_radius_x is not None or self.approach_resume_credit):
+                # Dwelling, waiting for a floor, recovering or a lost position: the
+                # release/pulse cycle (and any credit built from it) must not outlive
+                # the approach it measured. Without the opt-in keys the cycle is left as is.
+                self._reset_pulse()
+
+    def _step(self, pos: tuple[int, int] | None, now: float, on_ladder: bool = False) -> Command:
         if self.recovery_terminal:
             self.state = "blocked"
             return Command.NONE
         if self.returning_to_start:
             return self._step_return(pos, now, on_ladder)
+        if self.rejoining:
+            return self._step_platform_rejoin(pos, now, on_ladder)
         command = self._step_route(pos, now, on_ladder)
         if self.state == "blocked" and self.return_on_block and not self.movement_test:
             if self.request_return_to_start():
@@ -846,6 +1550,7 @@ class MinimapCircuit:
         t = self._clock.update(now, pos is not None)
         if pos is None:
             self._reset_alignment()
+            self._reset_offroute()
             self._rejoin_floor = self._rejoin_y = self._rejoin_since = None
             self._jump_landing_since = self._jump_landing_y = None
             self._jump_landing_frames = 0
@@ -882,6 +1587,23 @@ class MinimapCircuit:
             return self._step_ramp(pos, t)
         floor_ready = self._walk_floor_ready(pos, t)
         point = self.waypoints[self.idx]
+        if point.action == "walk":
+            # The legacy stable-fall rejoin above keeps precedence while it is pending.
+            if not floor_ready and self._rejoin_floor is None and self._recovery_until is None:
+                expected = self._wp_meta(self.idx).get("platform_id")
+                ahead = self._arrival_jump_index(pos, expected)
+                if ahead is not None:
+                    # Knocked across the gap before the takeoff walk finished: hand the
+                    # frame to that jump waypoint, whose own destination proof decides.
+                    if self._offroute_stable(pos, ahead[1], t):
+                        self._set_waypoint(ahead[0], t)
+                        self.state = "jump_arrived_checking"
+                        return Command.NONE
+                elif (self._platform_rejoin_due(pos, t, expected)
+                        and self._begin_platform_rejoin(pos, t, expected)):
+                    return Command.NONE
+            else:
+                self._reset_offroute()
         dx = point.x - pos[0]
         dy = self._height_at(point.x, point.y, pos[0]) - pos[1]
         progressing = False
@@ -919,7 +1641,10 @@ class MinimapCircuit:
                                "right" if dx > self.tolerance_x else "none", "none", jump)
             self._recovery_until = None
             self._started = t
-        if t - self._started >= self.timeout_s:
+        on_rope = expired = False
+        if self.commit_budget and point.action == "climb":
+            on_rope, expired = self._climb_commit(point, pos, dx, reached_y, t)
+        if expired or (not on_rope and t - self._started >= self.timeout_s):
             if self.retries >= self.max_retries:
                 self.reason = "waypoint timeout"
                 self.state = "blocked"
@@ -940,8 +1665,11 @@ class MinimapCircuit:
         alignment = self.tolerance_x if point.action == "walk" else self.align_tolerance_x
         if abs(dx) > alignment:
             self.state = "walking" if point.action == "walk" else "aligning"
+            room = (self._takeoff_room(self._previous_walk_platform(), pos, dx)
+                    if point.action == "climb" and self.takeoff_far_approach
+                    else self._walk_room(point, pos, dx))
             return (Command("left" if dx < 0 else "right") if point.action == "walk" and not self.precision_walk
-                    else self._precision_approach(dx, t))
+                    else self._precision_approach(dx, t, room))
         if point.action in ("climb", "drop"):
             self._pulse_until = self._pulse_direction = None
             if self._aligned_since is None:

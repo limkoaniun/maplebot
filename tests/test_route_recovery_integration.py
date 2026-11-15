@@ -211,6 +211,133 @@ def test_return_interruption_releases_input_without_resetting_index_or_budget(mo
     _assert_no_extras(backend)
 
 
+def _regain_bot(monkeypatch, hp=80):
+    """Unsupported at (65,50): 'middle' (y=60) is the first drawn floor below, point 1 is left."""
+    bot, backend = _bot(monkeypatch, hp=hp)
+    bot.source.frame = _vertical_frame((65, 50))
+    wall = [100.0]
+    bot.keyboard.clock = lambda: wall[0]
+    sequence = [0]
+    sample = [None]
+
+    def get_sample(after_sequence=None):
+        current = sample[0]
+        if current is None or wall[0] - current.captured_at > .75 or after_sequence == current.sequence:
+            return None
+        return current
+
+    def step(now, fresh=True):
+        wall[0] = 100 + now
+        if fresh:
+            sequence[0] += 1
+            sample[0] = SimpleNamespace(frame=bot.source.frame, sequence=sequence[0], captured_at=wall[0])
+        snap = bot.step(now)
+        bot.keyboard.apply_once(now)
+        return snap
+
+    bot.source.get_sample = get_sample
+    return bot, backend, step, wall
+
+
+def _regain_to_pulse(bot, step):
+    assert bot.brain.circuit.request_return_to_start()
+    nav = bot.brain.circuit
+    for i in range(6):
+        snap = step(i * .125)
+        assert snap.command == Command.NONE and nav.recovery_state == "regaining_support"
+        assert not bot.keyboard._held_x
+    snap = step(.75)
+    assert snap.command == Command("left") and snap.command.valid_for_s == pytest.approx(.25)
+    assert nav.state == "return_regain_walking" and nav.recovery is None
+    return nav
+
+
+def test_regain_pulse_is_a_leased_navigation_only_command(monkeypatch):
+    bot, backend, step, wall = _regain_bot(monkeypatch)
+    _seed_old_actions(bot)
+    monkeypatch.setattr(bot.brain, "decide", lambda p: pytest.fail("ordinary brain ran during regain"))
+    nav = _regain_to_pulse(bot, step)
+    assert bot.keyboard.enabled and bot.keyboard._navigation_only and backend.held == {"left"}
+    assert bot.keyboard._command_deadline == pytest.approx(wall[0] + .25)
+    assert bot.brain.state == "minimap_route_return_regain_walking"
+    assert nav.return_count == 1 and nav.returning_to_start
+    assert not any(event == "down" and key in {"up", "c"} for event, key in backend.events)
+    _assert_no_extras(backend)
+
+
+def test_duplicate_capture_during_regain_pulse_sends_nothing_new_and_cannot_extend_it(monkeypatch):
+    bot, backend, step, wall = _regain_bot(monkeypatch)
+    _regain_to_pulse(bot, step)
+    lease, events = bot.keyboard._command_deadline, list(backend.events)
+    assert backend.held == {"left"}
+    assert step(.8, fresh=False) is None and bot.capture_state == "duplicate"
+    assert bot.keyboard._command_deadline == lease and backend.events == events
+    # No fresh frame arrives: the keyboard ends the pulse at its own deadline.
+    assert step(1.05, fresh=False) is None
+    assert bot.keyboard._command_deadline in (None, lease)  # expired, never renewed
+    assert not backend.held and backend.events == events + [("up", "left")]
+    assert bot.brain.circuit._regain.moves == 1
+
+
+def test_fresh_frames_during_a_regain_pulse_cannot_extend_it(monkeypatch):
+    bot, backend, step, wall = _regain_bot(monkeypatch)
+    _regain_to_pulse(bot, step)
+    lease = bot.keyboard._command_deadline
+    assert lease == pytest.approx(100.75 + .25) and backend.held == {"left"}
+    snap = step(.875)  # a new capture inside the pulse: only the remaining time
+    assert snap.command == Command("left") and snap.command.valid_for_s == pytest.approx(.125)
+    assert bot.keyboard._command_deadline == pytest.approx(lease) and backend.held == {"left"}
+    for now in (1.0, 1.125, 1.25):  # the pulse is over: release, however fresh the frames
+        assert step(now).command == Command.NONE
+        assert not backend.held
+    assert backend.events.count(("down", "left")) == 1 and backend.events.count(("up", "left")) == 1
+
+
+@pytest.mark.parametrize("hp", [39, None])
+def test_low_or_unreadable_hp_during_regain_aborts_and_releases_movement(monkeypatch, hp):
+    bot, backend, step, _ = _regain_bot(monkeypatch)
+    nav = _regain_to_pulse(bot, step)
+    origin = nav.idx
+    assert backend.held == {"left"}
+    monkeypatch.setattr("maplebot.bot.read_bars", lambda *args: (hp, 80, 1))
+    snap = step(.875)
+    assert snap.command == Command.NONE
+    assert not backend.held and not bot.keyboard.enabled and bot.paused
+    assert nav.recovery_terminal and nav.recovery_state == "failed" and nav.recovery is None
+    assert nav.idx == origin and nav.return_count == 1
+    assert ("unreadable" if hp is None else "below 40%") in nav.recovery_reason
+    step(1.0)
+    assert not backend.held and not any(event == "down" and key in {"left", "right", "down", "up", "c"}
+                                        for event, key in backend.events[2:])
+    _assert_no_extras(backend)
+
+
+@pytest.mark.parametrize("loss", ["focus", "map", "pause", "dot"])
+def test_regain_interruption_disables_input_and_requires_a_new_settle(monkeypatch, loss):
+    bot, backend, step, _ = _regain_bot(monkeypatch)
+    nav = _regain_to_pulse(bot, step)
+    origin = nav.idx
+    assert backend.held == {"left"}
+    if loss == "focus":
+        monkeypatch.setattr(bot.keyboard, "is_active", lambda: False)
+    elif loss == "map":
+        bot.map_recognizer = SimpleNamespace(
+            observe=lambda *args: MapMatch("unknown"), reset=lambda: None)
+    elif loss == "dot":
+        bot.source.frame = bot.source.frame.copy()
+        bot.source.frame[61:181, 11:161] = 40
+    else:
+        bot.toggle_pause()  # F1
+    snap = step(.875)
+    assert snap is None or snap.command == Command.NONE
+    assert not bot.keyboard.enabled and not backend.held
+    assert nav.returning_to_start and not nav.recovery_terminal and nav.recovery is None
+    assert nav.idx == origin and nav.return_count == 1
+    assert nav._regain.phase == "settling" and nav._regain.moves == 1
+    assert [key for event, key in backend.events if event == "down"] == ["left"]
+    _assert_no_extras(backend)
+
+
 def _request_ready_bot(monkeypatch):
     bot, backend = _bot(monkeypatch)
     bot.paused = True
