@@ -125,6 +125,7 @@ def snapshot_details(bot, snap):
         'rejoin_state': getattr(circuit, 'rejoin_state', 'idle'),
         'rejoin_reason': getattr(circuit, 'rejoin_reason', None),
         'arrival_count': getattr(circuit, 'arrival_count', 0),
+        'zone_takeoffs': getattr(circuit, 'zone_takeoffs', 0),
         'loot_state': loot.state if loot is not None else None,
         'player_score': float(fix.score) if fix is not None else None,
         'player_source': fix.source if fix is not None else None,

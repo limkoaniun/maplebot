@@ -385,3 +385,23 @@ def test_rejoin_and_arrival_reporting_does_not_change_a_verified_lap(evidence):
     assert summary["all_transition_indices_observed"] and summary["all_landings_observed"]
     assert summary["maximum_rejoin_count"] == 2 and summary["arrivals_without_takeoff"] == 1
     assert not summary["attempt_resets"]
+
+
+def test_zone_takeoffs_are_reported_since_the_watch_began_and_change_no_verdict(evidence):
+    first, _, clock = evidence
+
+    def lap(count):
+        tracker, clock[0] = watcher.LapEvidence(first.circuit), 1000.
+        for index in [i for i in range(44) for _ in range(3)] + [0]:
+            clock[0] += .31
+            tracker.observe({"updated": clock[0], "minimap": [49, 105], "minimap_seen": True, "circuit_index": index,
+                             "return_count": 0, "returning_to_start": False, "recovery_state": "idle", **count(index)})
+        return tracker.summary()
+    # Counted since the controller's circuit was built (5 before this watch), then 7 more in the lap.
+    zoned = lap(lambda index: {"zone_takeoffs": 5 + min(7, index // 6)})
+    assert zoned["maximum_zone_takeoffs"] == 7
+    assert zoned["full_wrap_observed"] and zoned["stable_ground_return"]
+    assert zoned["all_transition_indices_observed"] and zoned["all_landings_observed"] and not zoned["attempt_resets"]
+    plain = lap(lambda index: {})  # a controller that does not publish the counter
+    assert plain["maximum_zone_takeoffs"] == 0
+    assert {**zoned, "maximum_zone_takeoffs": 0} == plain  # nothing else in the summary depends on it

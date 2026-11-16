@@ -99,13 +99,20 @@ class MinimapCircuit:
     RESUME_RELEASE_FLOOR_S = 0.15
     # Key-up slide plus whole-pixel rounding the edge margin must cover beyond the stop margin.
     EDGE_OVER_STOP_MARGIN_X = 0.75
+    # Sideways drift of a fall: a drop launched from its zone may land this far beside the zone.
+    ZONE_LANDING_DRIFT_X = 2.0
 
-    def __init__(self, cfg: dict, *, far_approach: bool = True, resume_credit: bool | None = None):
+    def __init__(self, cfg: dict, *, far_approach: bool = True, resume_credit: bool | None = None,
+                 zone_kinds: tuple = ()):
         """``far_approach=False`` ignores the opt-in far-pulse and resume-credit keys.
 
         ``resume_credit=False`` ignores ``approach_resume_credit`` alone (a
         return/rejoin child that may use far pulses is never interrupted by
         combat or loot, so it has nothing to credit).
+
+        ``zone_kinds`` are the transition kinds that may use ``takeoff_zones``
+        in a movement test. Only a parent whose own zones are in effect passes
+        them, to its return/rejoin child; an editor connection test never does.
         """
         self._cfg = deepcopy(cfg)
         self.return_on_block = bool(cfg.get("return_on_block", False))
@@ -247,6 +254,35 @@ class MinimapCircuit:
                 raise ValueError(f"{name} needs approach_fine_radius_x and the far approach keys")
         # A child built without far pulses keeps fine taps for its takeoffs too.
         self.takeoff_far_approach = takeoff_far and far_approach
+        # Opt-in take-off zones (OFF when absent; maplebot/nav/zones.py). The FIRST
+        # attempt of a jump, ramp or drop may take off from a stretch of its source
+        # platform where the saved geometry gives the same outcome, instead of from
+        # one saved pixel. Landing proof, support tests and tolerances are untouched.
+        # ``_zone_kinds`` is empty unless zones are in effect, and nothing else of
+        # this feature is read while it is empty.
+        self.takeoff_zones = cfg.get("takeoff_zones", False)
+        if type(self.takeoff_zones) is not bool:
+            raise ValueError("takeoff_zones must be true or false")
+        self._zone_kinds = ()
+        if self.takeoff_zones:
+            for name, default, low, high in (("takeoff_zone_max_x", 8, 1, 20), ("takeoff_zone_margin_x", 1.5, 1, 4)):
+                value = cfg.get(name, default)
+                if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                        or not math.isfinite(value) or not low <= value <= high):
+                    raise ValueError(f"{name} must be finite and between {low} and {high}")
+                setattr(self, name, float(value))
+            kinds = cfg.get("takeoff_zone_kinds", ["drop", "jump", "ramp"])
+            if (not isinstance(kinds, (list, tuple)) or not kinds or len(set(map(repr, kinds))) != len(kinds)
+                    or not all(isinstance(kind, str) and kind in ("drop", "jump", "ramp") for kind in kinds)):
+                raise ValueError("takeoff_zone_kinds must be a non-empty list of drop, jump and ramp without repeats")
+            if not self.movement_test and not has_plan:
+                raise ValueError("takeoff_zones needs a saved editor plan")
+            if has_plan:
+                # A movement test takes only what its parent hands it, and never a jump.
+                self._zone_kinds = (tuple(k for k in ("drop", "ramp") if k in zone_kinds and k in kinds)
+                                    if self.movement_test else tuple(k for k in ("jump", "ramp", "drop") if k in kinds))
+        self.zone_takeoffs = 0  # take-offs made outside the legacy window, children included
+        self._zone_cache = {}
         self.align_settle_s = float(cfg.get("align_settle_s", 0.25))
         self.climb_jitter_x = float(cfg.get("climb_jitter_x", 2))
         self.jump_flight_timeout_s = float(cfg.get("jump_flight_timeout_s", 2))
@@ -327,6 +363,7 @@ class MinimapCircuit:
         self._suspended = False
         self._approached = False
         self._reset_commit()
+        self._reset_zone()
         self._reset_alignment()
         self._reset_jump()
         self._reset_drop()
@@ -582,6 +619,110 @@ class MinimapCircuit:
                 self._started += now - self._commit_started
             self._commit_started = self._commit_progress_at = self._commit_best = None
 
+    # --- takeoff_zones: a first attempt may take off from a stretch of its source platform ---
+    def _reset_zone(self) -> None:
+        self._zone_open = True     # no attempt of this waypoint selection has launched or failed
+        self._zone_x = None        # the X at which the running settle began
+        self._zone_start_x = None  # X_t of a take-off made while the zone was open
+        self._zone_land_since = None  # since when a drop has been on its destination, frame after frame
+
+    def _zone(self, idx: int):
+        """Cached zone ``(lo, hi)`` of waypoint ``idx``; None is the saved take-off alone.
+
+        A jump, ramp or drop gets its own zone from the saved plan. A walk gets
+        the zone of the transition that takes off from its platform at its X,
+        so the walk in front of a zoned take-off does not demand the saved
+        pixel either. A zone lies inside its source platform's span: a position
+        inside the zone is inside that span.
+        """
+        if idx not in self._zone_cache:
+            from maplebot.nav.zones import takeoff_zone
+
+            point, meta, zone = self.waypoints[idx], self._wp_meta(idx), None
+            if point.action == "walk":
+                ahead = idx + 1 if idx + 1 < len(self.waypoints) else 0 if self.loop else None
+                if ahead is not None and self.waypoints[ahead].action in self._zone_kinds:
+                    target = self.waypoints[ahead]
+                    takeoff_x = target.x if target.action == "drop" else target.from_x
+                    if (meta.get("platform_id") is not None and abs(point.x - takeoff_x) <= 1e-6
+                            and self._wp_meta(ahead).get("from_platform") == meta.get("platform_id")):
+                        zone = self._zone(ahead)
+            elif point.action in self._zone_kinds:
+                before = (idx - 1) % len(self.waypoints)
+                # A drop has no take-off of its own: it leaves from the walk waypoint before it.
+                if point.action != "drop" or (
+                        self.waypoints[before].action == "walk" and abs(self.waypoints[before].x - point.x) <= 1e-6
+                        and self._wp_meta(before).get("platform_id") == meta.get("from_platform")):
+                    zone = takeoff_zone(
+                        self._cfg["editor_plan"], kind=point.action, from_platform=meta.get("from_platform"),
+                        to_platform=meta.get("to_platform"), to_x=point.x,
+                        from_x=point.x if point.action == "drop" else point.from_x,
+                        max_x=self.takeoff_zone_max_x, margin_x=self.takeoff_zone_margin_x,
+                        legacy_tolerance_x=self._legacy_tolerance(point.action))
+            self._zone_cache[idx] = zone
+        return self._zone_cache[idx]
+
+    def _legacy_tolerance(self, action: str) -> float:
+        """The take-off alignment tolerance of a transition kind without a zone."""
+        return (self.jump_align_tolerance_x if action == "jump" else self.drop_align_tolerance_x
+                if action == "drop" else max(self.align_tolerance_x, self.tolerance_x))
+
+    def _open_zone(self):
+        """The current transition's zone while no attempt of this selection has launched or failed."""
+        return self._zone(self.idx) if self._zone_open else None
+
+    @staticmethod
+    def _inside(zone, pos) -> bool:
+        return zone is not None and zone[0] <= pos[0] <= zone[1]
+
+    def _zone_settle(self, x: float) -> None:
+        """X stillness while a zone is open: a settle belongs to the pixel it began on."""
+        if self._aligned_since is None or self._zone_x is None or abs(x - self._zone_x) > 0.5:
+            self._aligned_since, self._zone_x = None, x
+
+    def _zone_takeoff(self, zone, x: float) -> None:
+        """Every take-off closes the zone; X_t is kept only for one made while it was open."""
+        point = self.waypoints[self.idx]
+        self._zone_open, self._zone_start_x = False, x if zone is not None else None
+        saved_x = point.x if point.action == "drop" else point.from_x
+        if zone is not None and abs(x - saved_x) > self._legacy_tolerance(point.action):
+            self.zone_takeoffs += 1
+
+    def _zone_spent(self) -> None:
+        """A failed attempt or a lower ledge: the saved spot and its own tolerance from here on."""
+        self._zone_open, self._zone_start_x = False, None
+
+    def _ramp_from_x(self, point: Waypoint) -> float:
+        """Where the running ramp attempt started: X_t inside an open zone, else the saved X."""
+        if self._zone_kinds and self._zone_start_x is not None:
+            return self._zone_start_x
+        return point.from_x
+
+    def _zone_landed(self, point: Waypoint, pos, destination: Platform | None) -> bool:
+        """A drop launched from its zone outside the legacy window lands beside the saved X.
+
+        Asked only after the unchanged landing proof. The window is the zone
+        plus the sideways drift of a fall, inside the destination platform.
+        """
+        zone, drift = self._zone(self.idx), self.ZONE_LANDING_DRIFT_X
+        return (zone is not None and self._zone_start_x is not None
+                and abs(self._zone_start_x - point.x) > self.drop_align_tolerance_x
+                and destination is not None and destination.left <= pos[0] <= destination.right
+                and zone[0] - drift <= pos[0] <= zone[1] + drift)
+
+    def _child_zone_kinds(self) -> tuple:
+        """What a return/rejoin child may take from a zone: our drops and ramps, never a jump."""
+        return tuple(kind for kind in ("drop", "ramp") if kind in self._zone_kinds)
+
+    def _step_child(self, child: "MinimapCircuit", pos, now: float, on_ladder: bool) -> Command:
+        """Step a return/rejoin child; its zone take-offs count in this circuit's total."""
+        if not self._zone_kinds:
+            return child.step(pos, now, on_ladder)
+        counted = child.zone_takeoffs
+        command = child.step(pos, now, on_ladder)
+        self.zone_takeoffs += child.zone_takeoffs - counted
+        return command
+
     def _precision_approach(self, dx: float, now: float, room: float | None = None) -> Command:
         """Release before small corrections so momentum and capture lag can settle."""
         direction = "left" if dx < 0 else "right"
@@ -659,6 +800,7 @@ class MinimapCircuit:
         self._rejoin_failed_idx = None  # at most one failed rejoin per waypoint selection
         self._reset_offroute()
         self._reset_commit()
+        self._reset_zone()
         self._reset_alignment()
         self._reset_jump()
         self._reset_drop()
@@ -681,7 +823,7 @@ class MinimapCircuit:
         """Release during one small backward knockback; only rearm on this stair."""
         point = self.waypoints[self.idx]
         sign = 1 if point.x > point.from_x else -1
-        backward = (point.from_x - pos[0]) * sign
+        backward = (self._ramp_from_x(point) - pos[0]) * sign
         landing_tolerance = min(1.0, self.tolerance_y)
         support_error = source.support_error(pos)
         # An upward hit may briefly lift the character off the stair. A position
@@ -746,7 +888,8 @@ class MinimapCircuit:
                 return Command.NONE
             self._reset_offroute()
             dx = point.from_x - pos[0]
-            if abs(dx) > max(self.align_tolerance_x, self.tolerance_x):
+            zone = self._open_zone() if self._zone_kinds else None
+            if abs(dx) > max(self.align_tolerance_x, self.tolerance_x) and not self._inside(zone, pos):
                 self.state = "ramp_aligning"
                 return self._precision_approach(dx, now, self._takeoff_room(source, pos, dx)
                                                 if self.takeoff_far_approach else None)
@@ -754,17 +897,23 @@ class MinimapCircuit:
             if self._ramp_source_y is None or abs(pos[1] - self._ramp_source_y) > 0.5:
                 self._aligned_since = None
                 self._ramp_source_y = pos[1]
+            if zone is not None:
+                self._zone_settle(pos[0])
             if self._aligned_since is None:
                 self._aligned_since = now
             if now - self._aligned_since < self.align_settle_s:
                 self.state = "ramp_settling"
                 return Command.NONE
             self._ramp_started = True
+            if self._zone_kinds:
+                self._zone_takeoff(zone, pos[0])
             if self.commit_budget:
                 self._commit_begin(now)
                 committed = True
 
-        low_x, high_x = sorted((point.from_x, point.x))
+        # A ramp that took off inside its zone is judged from where it started.
+        from_x = self._ramp_from_x(point)
+        low_x, high_x = sorted((from_x, point.x))
         fraction = (pos[0] - point.from_x) / (point.x - point.from_x)
         expected_y = point.from_y + min(1.0, max(0.0, fraction)) * (point.y - point.from_y)
         destination = self._containing_platform((point.x, point.y))
@@ -784,7 +933,7 @@ class MinimapCircuit:
         on_reached_floor = self._ramp_destination_seen and destination is not None and supported
         if (pos[0] < low_x - self.tolerance_x or pos[0] > high_x + self.tolerance_x
                 or corridor_error > self.ramp_corridor_y) and not (landed_beyond or on_reached_floor):
-            backward = (point.from_x - pos[0]) * (1 if direction == "right" else -1)
+            backward = (from_x - pos[0]) * (1 if direction == "right" else -1)
             if (not self._ramp_destination_seen and self._ramp_retry_count == 0
                     and source is not None and source.sloped
                     and self.tolerance_x < backward <= 3.0
@@ -876,6 +1025,13 @@ class MinimapCircuit:
         destination = self._containing_platform((point.x, point.y))
         at_destination = (self._support_error(point.x, point.y, pos) <= landing_tolerance
                           and (destination is None or destination.left <= pos[0] <= destination.right))
+        if self._zone_kinds:
+            # Since when every fresh frame has been on the destination: the dwell of a
+            # landing accepted beside the saved X (``stable_for`` follows the height only).
+            if not at_destination:
+                self._zone_land_since = None
+            elif self._zone_land_since is None:
+                self._zone_land_since = now
         if committed:
             # From the launch (or an observed departure) the fall has its own budget;
             # the landing proof gets its dwell on top and counts as progress.
@@ -894,6 +1050,12 @@ class MinimapCircuit:
                 self._commit_end(now)
             if abs(dx) <= self.tolerance_x:
                 self._advance(now)
+                return Command.NONE
+            if self._zone_kinds and self._zone_landed(point, pos, destination):
+                # Beside the saved X the whole dwell must have been on the destination,
+                # not a height held elsewhere and then one frame here.
+                if now - self._zone_land_since >= max(0.25, point.dwell_s):
+                    self._advance(now)
                 return Command.NONE
             # Horizontal correction is allowed only after a stable destination landing.
             return self._precision_approach(dx, now)
@@ -914,6 +1076,7 @@ class MinimapCircuit:
                 self._drop_launched_at = None
                 self._drop_departed = False
                 self.retries = 0
+                self._zone_spent()  # the zone was drawn for the saved source floor, not for this ledge
                 self._reset_alignment()
                 if committed:
                     self._commit_end(now)  # a new takeoff from this lower ledge
@@ -938,6 +1101,7 @@ class MinimapCircuit:
                     return self._block_drop("drop did not leave source floor")
                 self.retries += 1
                 self._drop_launched_at = None
+                self._zone_spent()
                 self._reset_alignment()
                 if committed:
                     self._commit_end(now)  # never left the floor: re-aligning is pre-takeoff time
@@ -945,11 +1109,14 @@ class MinimapCircuit:
         if abs(pos[1] - self._drop_source_y) > 1:
             self.state = "dropping"
             return Command.NONE
-        if abs(dx) > self.drop_align_tolerance_x:
+        zone = self._open_zone() if self._zone_kinds else None
+        if abs(dx) > self.drop_align_tolerance_x and not self._inside(zone, pos):
             self.state = "aligning"
             return self._precision_approach(dx, now, self._takeoff_room(self._previous_walk_platform(), pos, dx)
                                             if self.takeoff_far_approach else None)
         self._pulse_until = self._pulse_direction = None
+        if zone is not None:
+            self._zone_settle(pos[0])
         if self._aligned_since is None:
             self._aligned_since = now
         if now - self._aligned_since < self.align_settle_s or stable_for < self.align_settle_s:
@@ -959,6 +1126,8 @@ class MinimapCircuit:
         self._drop_launched_at = now
         self._drop_launch_ended = False
         self.state = "dropping"
+        if self._zone_kinds:
+            self._zone_takeoff(zone, pos[0])
         if self.commit_budget:
             self._commit_begin(now, pos[1])
         return Command("none", "down", "jump")
@@ -974,6 +1143,7 @@ class MinimapCircuit:
         self._jump_landing_frames = 0
 
     def _jump_failed(self, now: float) -> Command:
+        self._zone_spent()
         if self.retries >= self.max_retries:
             self.reason = "jump timeout"
             self.state = "blocked"
@@ -1085,7 +1255,8 @@ class MinimapCircuit:
                 return Command.NONE
             self._reset_offroute()
             dx = point.from_x - pos[0]
-            if abs(dx) > self.jump_align_tolerance_x:
+            zone = self._open_zone() if self._zone_kinds else None
+            if abs(dx) > self.jump_align_tolerance_x and not self._inside(zone, pos):
                 self.state = "jump_aligning"
                 return self._precision_approach(dx, now, self._takeoff_room(
                     self._containing_platform((point.from_x, point.from_y)), pos, dx)
@@ -1094,6 +1265,8 @@ class MinimapCircuit:
             if self._jump_takeoff_y is None or abs(pos[1] - self._jump_takeoff_y) > 0.5:
                 self._aligned_since = None
                 self._jump_takeoff_y = pos[1]
+            if zone is not None:
+                self._zone_settle(pos[0])
             if self._aligned_since is None:
                 self._aligned_since = now
             if now - self._aligned_since < self.align_settle_s:
@@ -1103,6 +1276,8 @@ class MinimapCircuit:
             self._jump_started = now
             self._jump_min_y = pos[1]
             self.state = "jumping"
+            if self._zone_kinds:
+                self._zone_takeoff(zone, pos[0])
             return Command(direction, "none", "jump")
         flight_s = now - self._jump_started
         self._jump_min_y = min(self._jump_min_y, pos[1])
@@ -1272,7 +1447,8 @@ class MinimapCircuit:
         try:
             child = MinimapCircuit(plan_rejoin(self._cfg, pos, self.idx,
                                                self.platform_rejoin_max_transitions),
-                                   far_approach=self.recovery_far_approach, resume_credit=False)
+                                   far_approach=self.recovery_far_approach, resume_credit=False,
+                                   zone_kinds=self._child_zone_kinds())
         except ValueError as exc:
             # Unplannable: latch for this waypoint, spend nothing, keep waiting as before.
             self._rejoin_failed_idx = self.idx
@@ -1351,7 +1527,7 @@ class MinimapCircuit:
             # A committed flight, ramp or rope is never cut: it ends by its own
             # bounded proof or block, and the rejoin fails on the next free frame.
             return self._finish_platform_rejoin(False, "Rejoin timed out")
-        command = child.step(pos, now, on_ladder)
+        command = self._step_child(child, pos, now, on_ladder)
         self.state = "rejoin_" + child.state
         if child.state == "blocked":
             return self._finish_platform_rejoin(
@@ -1481,13 +1657,14 @@ class MinimapCircuit:
                 # opt-in far pulses were tuned on: it keeps the vision-gated fine taps
                 # unless recovery_far_approach opts in. It never uses resume credit.
                 self.recovery = MinimapCircuit(plan_return_to_start(self._cfg, pos),
-                                               far_approach=self.recovery_far_approach, resume_credit=False)
+                                               far_approach=self.recovery_far_approach, resume_credit=False,
+                                               zone_kinds=self._child_zone_kinds())
             except ValueError as exc:
                 self.abort_return_to_start(str(exc))
                 return Command.NONE
             self.recovery_state = "running"
             self._reset_return_stability()
-        command = self.recovery.step(pos, now, on_ladder)
+        command = self._step_child(self.recovery, pos, now, on_ladder)
         self.state = "return_" + self.recovery.state
         if self.recovery.state == "blocked":
             self.abort_return_to_start(self.recovery.reason or "Return route blocked")
@@ -1618,7 +1795,10 @@ class MinimapCircuit:
         if point.action == "climb":
             reached_y = reached_y and (dy >= -0.5 if self._vertical_direction == "up"
                                       else dy <= 0.5 if self._vertical_direction == "down" else abs(dy) <= 0.5)
-        if floor_ready and abs(dx) <= self.tolerance_x and reached_y:
+        # In front of a zoned take-off the walk is over anywhere inside that zone; floor,
+        # height and dwell are required as at the saved X.
+        at_x = abs(dx) <= self.tolerance_x or (self._zone_kinds and self._inside(self._zone(self.idx), pos))
+        if floor_ready and at_x and reached_y:
             self.state = "dwelling"
             if self._arrived is None:
                 self._arrived = t

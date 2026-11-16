@@ -248,6 +248,8 @@ class LapEvidence:
         self.max_rejoin_count = 0
         self.arrival_base = None
         self.max_arrival_count = 0
+        self.zone_base = None
+        self.max_zone_takeoffs = 0
         self.recovery_active = False
         self.last_recovery = None
         self.last_updated = None
@@ -304,12 +306,16 @@ class LapEvidence:
             self.resets.append({"updated": updated, "reason": "recovery", "observed_indices": list(self.observed)})
             self.reset_progress()
         self.max_return_count = max(count, self.max_return_count)
-        # Reported only: neither value changes what counts as a verified lap.
+        # Reported only: none of these values changes what counts as a verified lap.
         self.max_rejoin_count = max(int(status.get("rejoin_count") or 0), self.max_rejoin_count)
         arrivals = int(status.get("arrival_count") or 0)
         if self.arrival_base is None:
             self.arrival_base = arrivals
         self.max_arrival_count = max(arrivals, self.max_arrival_count)
+        zones = int(status.get("zone_takeoffs") or 0)
+        if self.zone_base is None:
+            self.zone_base = zones
+        self.max_zone_takeoffs = max(zones, self.max_zone_takeoffs)
         self.recovery_active = recovery
         if recovery:
             return
@@ -357,7 +363,9 @@ class LapEvidence:
                 "startup_events": self.startup_events, "maximum_return_count": self.max_return_count,
                 # A jump accepted by destination proof was not flown: say so next to the landings.
                 "maximum_rejoin_count": self.max_rejoin_count,
-                "arrivals_without_takeoff": self.max_arrival_count - (self.arrival_base or 0)}
+                "arrivals_without_takeoff": self.max_arrival_count - (self.arrival_base or 0),
+                # Take-offs made from a zone, outside the saved spot's own tolerance (takeoff_zones).
+                "maximum_zone_takeoffs": self.max_zone_takeoffs - (self.zone_base or 0)}
 
 
 def evidence_images(log, folder):

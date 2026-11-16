@@ -99,6 +99,18 @@ route:
     # approach_far_release_s: 0.3
     # takeoff_far_approach: true
     # recovery_far_approach: true
+    # Suggested take-off zones (see config/default.yaml and docs/DEVELOPMENT_HANDOFF.md).
+    # Offline-tested only, NOT live-verified, so they stay commented out here; enable them in
+    # a supervised run of their own. With these values the zones on this map are, in whole
+    # minimap pixels: gap jumps 90-91 (saved 91), top-drop 71-83 (saved 75), drop-4-3/3-2/2-1
+    # 52-64 (saved 60), drop-right-4-3/3-2 95-108 and drop-right-2-1 95-109 (saved 103); with
+    # ramp in takeoff_zone_kinds also the stair ramps 74-83 (saved 82). Stair-foot jumps, the
+    # barricade jump and drop, and the ropes keep their spot. The first supervised run leaves
+    # ramps out (see the handoff).
+    # takeoff_zones: true
+    # takeoff_zone_kinds: [drop, jump]
+    # takeoff_zone_max_x: 8
+    # takeoff_zone_margin_x: 1.5
     enabled: true
     start_idx: 0
     loop: true

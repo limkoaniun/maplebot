@@ -295,6 +295,23 @@ any paint program if needed; the bot reads exact colours.
   point 1 and when rejoining a platform. The last two need the `approach_*` keys. A
   saved map profile needs the keys in its `circuit_settings` too. Tested offline only;
   not yet verified in the game.
+- `route.circuit.takeoff_zones` (off by default) lets the first try of a jump, ramp or
+  drop start from a short stretch of the platform instead of from one exact spot, so a
+  character that was pushed a few pixels aside does not have to creep back first. The
+  bot works that stretch out from the drawn map: for a drop, the part of the floor where
+  nothing else is drawn in or next to the way down; for a ramp, the part of the stair
+  behind the saved start; for a jump over a small level gap, the last pixel or two
+  before the gap. It still stands still for the usual moment before it starts, every
+  landing is checked exactly as before, and a second try goes back to the saved spot.
+  `takeoff_zone_kinds` (all of `[drop, jump, ramp]`) picks which kinds get a stretch;
+  `[drop, jump]` keeps every ramp on its saved spot, which is the suggested setting for a
+  first supervised run, because a ramp started further back is committed to the stair
+  earlier and in offline tests that helped or hurt depending on where hits landed.
+  `takeoff_zone_max_x` (8) limits how far the stretch may reach from the saved spot and
+  `takeoff_zone_margin_x` (1.5) how close it may come to the end of a platform. Jumps
+  onto stairs or other heights, ropes, and connection tests in the map editor always
+  use the saved spot. A saved map profile needs the keys in its `circuit_settings`
+  too. Tested offline only; not yet verified in the game.
 - `route.circuit.arrive_on_destination` and `route.circuit.platform_rejoin` (both off by
   default) handle a character that was knocked onto a drawn platform the current route
   point does not expect. The first accepts a jump point when the character already stands

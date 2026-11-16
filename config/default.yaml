@@ -161,6 +161,41 @@ attack:
 #                                 for their walk legs (and for takeoffs when takeoff_far_approach is
 #                                 also true). They never use approach_resume_credit. Needs the
 #                                 approach_fine_radius_x keys. A return still never fights.
+# Optional route.circuit take-off zones (maplebot/nav/zones.py, maplebot/nav/circuit.py; OFF when
+# absent). Offline-tested only (tests/test_takeoff_zones.py), NOT live-verified. Landing proof,
+# support tests, settle time, lease lengths and retry counts are unchanged. Two things follow the
+# take-off point instead of the saved X: the landing X window of a drop launched away from its
+# saved spot, and the rear end of a ramp's corridor and knock-back window (a ramp started in its
+# zone also holds its direction key, unleased as every ramp, from up to takeoff_zone_max_x further
+# back). They need the saved editor plan, and a saved map profile needs the keys in its
+# circuit_settings too.
+#   takeoff_zones: false          true: the FIRST attempt of a jump, ramp or drop may take off from
+#                                 a short stretch of its source platform instead of from one saved
+#                                 pixel, and the walk waypoint in front of it ends anywhere on that
+#                                 stretch. The stretch comes from the saved map alone. Drop: where
+#                                 source and destination are level and no other drawn platform or
+#                                 saved rope lies in or beside the fall. Ramp: back along a sloped
+#                                 stair, not where another platform is at the stair's height. Jump:
+#                                 the last pixels before a level gap of at most 1.5 px, never
+#                                 further from the gap than the saved spot; every other jump and
+#                                 every rope keeps its saved spot. The settle before the take-off is
+#                                 unchanged and additionally needs X to stay on one pixel. After a
+#                                 launch or a failed attempt, on a lower ledge, in editor connection
+#                                 tests and for jumps on return/rejoin routes the saved spot and its
+#                                 own tolerance apply as before. A drop that took off away from its
+#                                 saved spot is accepted, after its unchanged landing proof, within
+#                                 the zone plus 2 px on the destination platform once its whole
+#                                 landing dwell was spent on the destination; a ramp started in
+#                                 its zone measures its corridor and knock-back from where it
+#                                 started. Read only when true:
+#     takeoff_zone_kinds: [drop, jump, ramp]
+#                                   which transition kinds get a zone (non-empty, no repeats).
+#                                   Return/rejoin routes use the drops and ramps of this list,
+#                                   never a jump. [drop, jump] keeps every ramp on its saved spot.
+#     takeoff_zone_max_x: 8         furthest a zone reaches from the saved take-off X (1-20)
+#     takeoff_zone_margin_x: 1.5    distance kept from the source platform's ends (1-4); a fall
+#                                   column stays this plus 1 px, and at least 2.5 px, clear of
+#                                   every other drawn platform and of the destination's ends
 # route.circuit regain-support stage (maplebot/nav/regain.py; code defaults apply when absent).
 # Runs before a return to point 1 is planned (Resume, Return to point 1, blocked-route recovery)
 # when the character is on no drawn platform. Offline-tested only, NOT live-verified.
