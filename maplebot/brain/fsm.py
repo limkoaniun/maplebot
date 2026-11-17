@@ -64,6 +64,24 @@ class Brain:
                 or not math.isfinite(pre) or not 0 <= pre <= 10):
             raise ValueError("attack.pre_transition_s must be between 0 and 10 seconds")
         self._pre_transition_s = float(pre)
+        # Opt-in take-off-side veto (absent, null or false = off): at a level gap
+        # take-off within this many minimap px of the gap edge, a same-platform
+        # detection on the side away from the flight ends the pre-takeoff fight for
+        # that frame, so the circuit steps as with pre_transition_s 0.
+        veto = self.attack_cfg.get("pre_transition_gap_veto_x")
+        if veto is None or veto is False:
+            self._gap_veto_x = None
+        elif (not isinstance(veto, (int, float)) or isinstance(veto, bool)
+                or not math.isfinite(veto) or not 0 < veto <= 20):
+            raise ValueError("attack.pre_transition_gap_veto_x must be a finite number above 0 and at most 20, "
+                             "or false")
+        else:
+            self._gap_veto_x = float(veto)
+        self.gap_veto_frames = 0
+        # route.circuit.gap_reentry: a bounded window per waypoint selection in which a
+        # pending re-entry is stepped before combat and loot (see decide()).
+        self._reentry_spent = 0.0
+        self.reentry_priority_frames = 0
         self._pre_key = self._decide_last = None
         self._pre_spent = self._frame_dt = 0.0
         # One pre-takeoff fight: the side it faces, when a qualifying detection
@@ -242,6 +260,7 @@ class Brain:
         key = None if nav is None else (nav.idx, bool(nav.returning_to_start))
         if key != self._pre_key:
             self._pre_key, self._pre_spent = key, 0.0  # next waypoint, or a return began/ended
+            self._reentry_spent = 0.0  # the re-entry priority window is per waypoint selection too
             self._end_pre_fight()
 
     def _pre_transition_fight(self, p: Perception) -> Command | None:
@@ -269,6 +288,12 @@ class Brain:
                 or not nav.takeoff_interruptible(p.minimap_pos)):
             self._end_pre_fight()
             return None
+        if self._gap_veto_x is not None and self._gap_veto(p):
+            # A threat behind the character at a gap edge: never hold the take-off
+            # column in an in-place fight. The circuit steps as without a pre-fight.
+            self.gap_veto_frames += 1
+            self._end_pre_fight()
+            return None
         # Keep the side already being fought while it still has a fresh qualifying
         # detection; with a monster on each side the nearest one changes per frame.
         self.target = self._pre_side
@@ -290,6 +315,35 @@ class Brain:
             return Command.NONE  # no attack and no movement without a fresh detection
         self._end_pre_fight()
         return None
+
+    def _gap_veto(self, p: Perception) -> bool:
+        """At a level gap take-off near its edge, a filtered detection away from the flight.
+
+        ``p.detections`` is the already filtered same-platform list; nothing else
+        is a target source here and nothing waits. Only an uncommitted level gap
+        jump in its align phase (``level_gap_takeoff``), with the character
+        strictly on that jump's source platform (and on no other drawn platform,
+        so never at an ambiguous stair-top column) and closer than
+        ``pre_transition_gap_veto_x`` to the gap edge, can be vetoed. A detection
+        only on the flight side keeps today's fight.
+        """
+        nav = self.circuit
+        gap = nav.level_gap_takeoff()
+        if gap is None or p.player is None or p.minimap_pos is None:
+            return False
+        x = p.minimap_pos[0]
+        source = gap.source
+        if (not source.left <= x <= source.right or source.support_error(p.minimap_pos) > nav.tolerance_y
+                or not abs(x - gap.edge_x) < self._gap_veto_x):
+            return False
+        # Strictly on the take-off floor means unambiguously: no other drawn platform
+        # supports the position too (e.g. a stair's top end at the gap edge column).
+        if any(other is not source and other.left <= x <= other.right
+               and other.support_error(p.minimap_pos) <= nav.tolerance_y for other in nav.platforms):
+            return False
+        if gap.direction == "left":
+            return any(d.box.center[0] > p.player[0] for d in p.detections)
+        return any(d.box.center[0] < p.player[0] for d in p.detections)
 
     def _pre_transition_combat(self, p: Perception, target: str) -> Command:
         """Ordinary combat command with every walk turned into facing.
@@ -376,6 +430,21 @@ class Brain:
             self._clear_combat_memory()
             cmd = self.circuit.step(p.minimap_pos, p.now, p.on_ladder)
             self.state = "circuit_" + self.circuit.state
+            return cmd
+        nav = self.circuit
+        if (nav is not None and nav.gap_reentry_active
+                and self._reentry_spent < nav.gap_reentry_priority_s
+                and nav.reentry_pending(p.minimap_pos)):
+            # Knocked back across a level gap: for a bounded, clock-charged window per
+            # waypoint selection the route alone is stepped (never suspended), so its
+            # 3-frame proof can form. No attack, no movement of our own, no loot.
+            self._reentry_spent += self._frame_dt
+            self.reentry_priority_frames += 1
+            self._clear_combat_memory()
+            self._pursuit_seen = None
+            self.loot.suspend(p.now)
+            cmd = nav.step(p.minimap_pos, p.now, p.on_ladder)
+            self.state = "circuit_" + nav.state
             return cmd
         target = self._choose_target(p)
         if target is not None and (self.circuit is not None or self.state != "recovering"):

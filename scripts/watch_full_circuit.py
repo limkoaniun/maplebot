@@ -232,6 +232,28 @@ class CaptureContinuity:
         return self.missing_since is not None and now-self.missing_since >= 2
 
 
+def _status_index(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def reentry_count(status):
+    """The controller's per-lap gap re-entry count, or None when absent or malformed."""
+    return _status_index(status.get("reentry_count"))
+
+
+def reentry_last(status):
+    """The last published re-entry {from_index, to_index, platform}, or None when malformed."""
+    value = status.get("reentry_last")
+    if not isinstance(value, dict):
+        return None
+    source, target = _status_index(value.get("from_index")), _status_index(value.get("to_index"))
+    if source is None or target is None or target >= source:
+        return None
+    platform = value.get("platform")
+    return {"from_index": source, "to_index": target,
+            "platform": platform if isinstance(platform, str) else None}
+
+
 class LapEvidence:
     """Forward progress and landing observations; recovery resets never count as wraps."""
     def __init__(self, circuit):
@@ -253,6 +275,10 @@ class LapEvidence:
         self.recovery_active = False
         self.last_recovery = None
         self.last_updated = None
+        # Gap re-entry (route.circuit.gap_reentry): the controller's own backward step
+        # to an already observed take-off. None until a fresh sample publishes a count.
+        self.last_reentry_count = None
+        self.reentries = []
         self.wrap = False
         self.reset_progress()
 
@@ -277,6 +303,11 @@ class LapEvidence:
         if updated == self.last_updated or not fresh(status):
             return
         self.last_updated = updated
+        # Exactly one re-entry since the previous fresh sample, or nothing to accept.
+        reentries = reentry_count(status)
+        reentry_step = (reentries is not None and self.last_reentry_count is not None
+                        and reentries == self.last_reentry_count+1)
+        self.last_reentry_count = reentries
         startup = str(status.get("startup_return_state") or "idle")
         if startup != self.last_startup:
             if startup != "idle":
@@ -329,6 +360,14 @@ class LapEvidence:
         elif index != self.previous:
             if self.previous == self.last and index == 0 and count == 0:
                 self.wrap = True
+            elif (index < self.previous and reentry_step
+                  and (step := reentry_last(status)) is not None
+                  and step["from_index"] == self.previous and step["to_index"] == index
+                  and index in self.observed):
+                # The controller re-ran a gap jump from its own observed take-off.
+                # Progress and landing proofs stand; the wrap still needs them all.
+                self.reentries.append({"updated": updated, "from": self.previous, "to": index,
+                                       "platform": step["platform"]})
             elif index < self.previous:
                 self.resets.append({"updated": updated, "reason": "backward index without complete wrap",
                                     "previous": self.previous, "index": index, "observed_indices": list(self.observed)})
@@ -356,6 +395,7 @@ class LapEvidence:
                     for t in self.landings]
         return {"full_wrap_observed": self.wrap, "observed_indices": self.observed,
                 "unobserved_forward_indices": sorted(set(self.skipped)), "attempt_resets": self.resets,
+                "reentries": deepcopy(self.reentries),
                 "transitions": landings, "all_transition_indices_observed": all(t["index_observed"] for t in landings),
                 "all_landings_observed": all(t["confirmed"] for t in landings),
                 "stable_ground_return": self.ground_proof.confirmed,

@@ -111,6 +111,14 @@ route:
     # takeoff_zone_kinds: [drop, jump]
     # takeoff_zone_max_x: 8
     # takeoff_zone_margin_x: 1.5
+    # Suggested gap re-entry (see config/default.yaml and docs/DEVELOPMENT_HANDOFF.md).
+    # Offline-tested only, NOT live-verified, so it stays commented out here. On this map a
+    # landing walk knocked back onto floor-N-right re-selects 10 -> 8, 18 -> 16 or 26 -> 24.
+    # Put the same lines in the map profile's circuit_settings; run it on its own, without
+    # attack.pre_transition_gap_veto_x.
+    # gap_reentry: true
+    # max_gap_reentries_per_lap: 2
+    # gap_reentry_priority_s: 1.5
     enabled: true
     start_idx: 0
     loop: true
@@ -1092,6 +1100,9 @@ attack:
   tie_margin_px: 12
   cooldown_s: 0.65
   mp_fallback_percent: 5.0
+  # Take-off-side veto at the gap jumps (see config/default.yaml). NOT live-verified; a separate
+  # A/B after gap_reentry, never together with it.
+  # pre_transition_gap_veto_x: 6
 health:
   fixed_rects:
   - - 503

@@ -103,6 +103,18 @@ attack:
   #                            # takeoff key is out, on a rope, or returning to point 1, the transition
   #                            # keeps absolute priority, as it does when the allowance is spent.
   #                            # Not live-verified.
+  # pre_transition_gap_veto_x: false  # absent/null/false = off. Otherwise a number above 0 and at most 20
+  #                            # (minimap px). At a LEVEL gap jump take-off (the take-off zone rule's level
+  #                            # gap: flat floors, gap 0-1.5 px, saved take-off 1-4 px from it) that is still
+  #                            # lining up, with the character strictly on the take-off floor (and on no
+  #                            # other drawn platform, so not at x=89 on the Construction Site right
+  #                            # floors, where a stair top overlaps) and closer than
+  #                            # this to the gap edge, a same-platform detection on the side AWAY from the
+  #                            # flight ends the pre-takeoff fight for that frame: the route steps exactly as
+  #                            # with pre_transition_s 0 (no attack, no wait). A detection only on the flight
+  #                            # side keeps the fight. Never on stairs, ramps, drops, ropes, stair jumps or
+  #                            # rejoin/return routes. Counted as gap_veto_frames. Offline-tested only, NOT
+  #                            # live-verified; A/B it separately from route.circuit.gap_reentry.
 
 # Optional loot keys (the `loot:` section is absent by default; see maplebot/nav/loot.py):
 #   walk_speed_x: 0    minimap px/s while a key is held, as an upper bound. > 0 sizes each leased
@@ -245,6 +257,40 @@ attack:
 #   is no floor-3-return / floor-4-return jump); arrive_on_destination covers that knock. Positions
 #   that are unsupported or on two overlapping drawn platforms (x=89 on the Construction Site
 #   right floors) keep the old wait. The older fall-to-a-lower-floor rejoin keeps precedence.
+# route.circuit gap re-entry (maplebot/nav/circuit.py, maplebot/brain/fsm.py; OFF when absent).
+# Needs the saved editor plan and drawn platforms; ignored by editor connection tests and by
+# return/rejoin routes. A saved map profile needs the keys in its circuit_settings too.
+# Offline-tested only (tests/test_gap_reentry.py), NOT live-verified.
+#   gap_reentry: false                true: a walk waypoint on the landing floor of a LEVEL gap
+#                                     jump (flat floors, gap 0-1.5 px, the take-off zone rule's
+#                                     test), knocked back onto that jump's take-off floor and
+#                                     stably there (3 fresh frames / 0.5 s / 0.5 px, strict
+#                                     support; x=89 on the Construction Site right floors never
+#                                     qualifies), re-selects the walk before the jump (10 -> 8,
+#                                     18 -> 16, 26 -> 24 on the Construction Site) and runs the
+#                                     saved jump again with its own unchanged landing proof. It is
+#                                     tried before platform_rejoin and spends no rejoin; the
+#                                     legacy lower-floor fall and arrive_on_destination keep
+#                                     precedence. Never for stair jumps, drops, ramps, ropes, in
+#                                     flight or landing, while recovering, rejoining or returning.
+#                                     While one is pending the brain steps the route before combat
+#                                     and loot for a short window (below): no attack, no own
+#                                     movement, the route clock runs; like a transition frame, a
+#                                     window frame drops remembered loot sites. Status: reentry_count,
+#                                     reentry_last, reentry_priority_frames.
+#     max_gap_reentries_per_lap: 2    re-entries per lap (1-5); only a completed lap resets it,
+#                                     never a re-selection, retry, rejoin or return. Read only when
+#                                     gap_reentry is on. Each re-entry re-selects walk g-1, jump g
+#                                     and walk g+1 with fresh timeout_s and max_retries each, and
+#                                     the pre-takeoff fight allowance (pre_transition_s) is fresh
+#                                     too. Bound on the Construction Site settings: about
+#                                     (15+0.6+15) s each for walk g-1, jump g and the fresh window
+#                                     of the landing walk g+1 + flight bounds + up to
+#                                     pre_transition_s of frozen pre-fight, roughly 100 s per
+#                                     re-entry and 200 s per lap at the default of 2.
+#     gap_reentry_priority_s: 1.5     brain priority window per waypoint selection while a
+#                                     re-entry is pending (0.5-3.0 s, charged per frame). Once it
+#                                     is spent, frames go to the ordinary combat/loot code.
 
 route:
   dir: minimaps

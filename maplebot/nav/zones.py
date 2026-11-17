@@ -133,6 +133,27 @@ def _jump_run(source, destination, x0, to_x, max_x, tolerance):
             else (max(x0 - tolerance, source.left), min(edge - GAP_INSET_X, x0 + max_x)))
 
 
+def level_gap(source, destination, x0, to_x):
+    """``(edge_x, "left" | "right")`` of a level gap jump from ``x0`` to ``to_x``, else None.
+
+    The same predicate as the jump zone rule (``_jump_run``): two flat platforms
+    without knots whose heights differ by at most ``GAP_LEVEL_Y``, a gap of
+    0-``GAP_MAX_X`` px between them, a landing X on the destination and a take-off
+    ``GAP_TAKEOFF_X`` px from the source's end on the gap side. Pure: it reads
+    no clock or plan and changes nothing; zones and their digests do not use it.
+    """
+    if (source.sloped or source.knots or destination.sloped or destination.knots
+            or abs(source.y - destination.y) > GAP_LEVEL_Y or to_x == x0
+            or not destination.left <= to_x <= destination.right):
+        return None
+    leftward = to_x < x0
+    edge = source.left if leftward else source.right
+    gap = source.left - destination.right if leftward else destination.left - source.right
+    if not 0 <= gap <= GAP_MAX_X or not GAP_TAKEOFF_X[0] <= abs(x0 - edge) <= GAP_TAKEOFF_X[1]:
+        return None
+    return float(edge), "left" if leftward else "right"
+
+
 def _zone(plan, kind, from_platform, to_platform, from_x, to_x, max_x, margin_x, legacy_tolerance_x):
     from maplebot.nav.circuit import Platform
 

@@ -405,3 +405,157 @@ def test_zone_takeoffs_are_reported_since_the_watch_began_and_change_no_verdict(
     plain = lap(lambda index: {})  # a controller that does not publish the counter
     assert plain["maximum_zone_takeoffs"] == 0
     assert {**zoned, "maximum_zone_takeoffs": 0} == plain  # nothing else in the summary depends on it
+
+
+# Gap re-entry (route.circuit.gap_reentry): the controller publishes reentry_count and
+# reentry_last {from_index, to_index, platform}; only an exact, single, observed step
+# back keeps lap progress. Everything else is the existing backward-index reset.
+REENTRY = {"from_index": 18, "to_index": 16, "platform": "floor-3-right"}
+
+
+def forward(sample, indices, **extra):
+    for index in indices:
+        for _ in range(3):
+            sample(index, **extra)
+
+
+def test_reentry_step_keeps_progress_and_lap_still_needs_every_landing(evidence):
+    tracker, sample, _ = evidence
+    forward(sample, range(19), reentry_count=0, reentry_last=None)
+    proofs = {index: proof.confirmed for index, proof in tracker.proofs.items()}
+    reentered = sample(16, reentry_count=1, reentry_last=REENTRY)
+    assert tracker.previous == 16 and not tracker.resets
+    assert {index: proof.confirmed for index, proof in tracker.proofs.items()} == proofs
+    forward(sample, range(16, 44), reentry_count=1, reentry_last=REENTRY)
+    sample(0, reentry_count=0, reentry_last=REENTRY)  # the controller's budget resets on the wrap
+    summary = tracker.summary()
+    assert summary["full_wrap_observed"] and summary["stable_ground_return"]
+    assert summary["all_transition_indices_observed"] and summary["all_landings_observed"]
+    assert not summary["attempt_resets"] and not summary["unobserved_forward_indices"]
+    assert summary["reentries"] == [{"updated": reentered["updated"], "from": 18, "to": 16,
+                                     "platform": "floor-3-right"}]
+
+
+def test_same_backward_step_without_reentry_fields_resets_as_today(evidence):
+    tracker, sample, _ = evidence
+    forward(sample, range(19))
+    sample(16)
+    assert tracker.resets[-1] == {"updated": tracker.last_updated, "reason": "backward index without complete wrap",
+                                  "previous": 18, "index": 16, "observed_indices": list(range(19))}
+    assert tracker.previous is None and tracker.observed == [] and not tracker.summary()["reentries"]
+
+
+def backward_after_progress(sample, before, after, *, indices=range(19)):
+    forward(sample, indices, **before)
+    sample(16, **after)
+
+
+@pytest.mark.parametrize("before,after", [
+    # reentry_last missing or malformed
+    ({"reentry_count": 0}, {"reentry_count": 1}),
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": None}),
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": [18, 16]}),
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": {"to_index": 16}}),
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": {**REENTRY, "from_index": True}}),
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": {**REENTRY, "to_index": "16"}}),
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": {**REENTRY, "to_index": 16.0}}),
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": {**REENTRY, "from_index": 16}}),
+    # reentry_count missing or malformed, before or after the step
+    ({}, {"reentry_count": 1, "reentry_last": REENTRY}),
+    ({"reentry_count": 0}, {"reentry_last": REENTRY}),
+    ({"reentry_count": 0}, {"reentry_count": True, "reentry_last": REENTRY}),
+    ({"reentry_count": 0}, {"reentry_count": 1.0, "reentry_last": REENTRY}),
+    ({"reentry_count": 0}, {"reentry_count": "1", "reentry_last": REENTRY}),
+    ({"reentry_count": "0"}, {"reentry_count": 1, "reentry_last": REENTRY}),
+    ({"reentry_count": -1}, {"reentry_count": 0, "reentry_last": REENTRY}),
+    # not exactly one new re-entry since the previous fresh sample
+    ({"reentry_count": 0}, {"reentry_count": 2, "reentry_last": REENTRY}),
+    ({"reentry_count": 1}, {"reentry_count": 1, "reentry_last": REENTRY}),
+    ({"reentry_count": 1}, {"reentry_count": 0, "reentry_last": REENTRY}),
+    # the published step is not the backward step the watcher saw
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": {**REENTRY, "from_index": 19}}),
+    ({"reentry_count": 0}, {"reentry_count": 1, "reentry_last": {**REENTRY, "to_index": 15}}),
+])
+def test_reentry_without_exact_published_step_resets(evidence, before, after):
+    tracker, sample, _ = evidence
+    backward_after_progress(sample, before, after)
+    assert tracker.resets[-1]["reason"] == "backward index without complete wrap"
+    assert tracker.resets[-1]["previous"] == 18 and tracker.resets[-1]["index"] == 16
+    assert tracker.observed == [] and not tracker.summary()["reentries"]
+
+
+def test_reentry_to_an_index_never_observed_resets(evidence):
+    tracker, sample, _ = evidence
+    forward(sample, [i for i in range(19) if i != 16], reentry_count=0)
+    sample(16, reentry_count=1, reentry_last=REENTRY)
+    assert tracker.resets[-1]["reason"] == "backward index without complete wrap"
+    assert not tracker.summary()["reentries"]
+
+
+def test_reentry_count_jump_of_two_resets_even_with_matching_step(evidence):
+    tracker, sample, _ = evidence
+    forward(sample, range(19), reentry_count=0)
+    sample(16, reentry_count=2, reentry_last=REENTRY)
+    assert tracker.resets[-1]["reason"] == "backward index without complete wrap"
+    assert not tracker.summary()["reentries"]
+
+
+def test_first_sample_only_initialises_the_reentry_count(evidence):
+    tracker, sample, _ = evidence
+    # The watch began after the controller had already re-entered this lap.
+    forward(sample, range(19), reentry_count=1, reentry_last=REENTRY)
+    sample(16, reentry_count=2, reentry_last=REENTRY)
+    assert tracker.observed == list(range(19)) and not tracker.resets
+    assert len(tracker.summary()["reentries"]) == 1
+
+
+def test_reentry_counter_without_backward_step_changes_nothing(evidence):
+    tracker, sample, _ = evidence
+    # Re-entered and walked back past the watcher's last index between two polls.
+    forward(sample, range(19), reentry_count=0)
+    forward(sample, range(19, 44), reentry_count=1, reentry_last=REENTRY)
+    sample(0, reentry_count=0)
+    summary = tracker.summary()
+    assert summary["full_wrap_observed"] and summary["all_landings_observed"]
+    assert not summary["attempt_resets"] and not summary["reentries"]
+
+
+def stream(sample, extra):
+    """A lap with an ordinary backward reset, then a recovery and a full lap."""
+    for index in [0, 5, 6, 7, 3] + [i for i in range(44) for _ in range(3)] + [0, 12, 5]:
+        sample(index, **extra(index))
+    sample(0, return_count=1, recovery_state="completed", **extra(0))
+
+
+@pytest.mark.parametrize("fields", [
+    lambda index: {"reentry_count": 0, "reentry_last": None},
+    lambda index: {"reentry_count": 0, "reentry_last": REENTRY},
+])
+def test_statuses_without_reentry_fields_behave_exactly_as_today(evidence, fields):
+    first, _, clock = evidence
+
+    def run(extra):
+        tracker, clock[0] = watcher.LapEvidence(first.circuit), 1000.
+        def sample(index, **values):
+            clock[0] += .31
+            tracker.observe({"updated": clock[0], "minimap": [49, 105], "minimap_seen": True,
+                             "circuit_index": index, "return_count": 0, "returning_to_start": False,
+                             "recovery_state": "idle", **values})
+        stream(sample, extra)
+        return tracker
+    old = run(lambda index: {})
+    assert old.last_reentry_count is None and old.summary()["reentries"] == []
+    assert [reset["reason"] for reset in old.resets] == [
+        "backward index without complete wrap", "backward index without complete wrap", "recovery"]
+    # A controller publishing a constant count is indistinguishable from an old one.
+    assert run(fields).summary() == old.summary()
+
+
+def test_malformed_count_between_valid_samples_breaks_the_step(evidence):
+    """A malformed reentry_count is no baseline: count 0, then 'x', then 1 is not one new re-entry."""
+    tracker, sample, _ = evidence
+    forward(sample, range(19), reentry_count=0)
+    sample(18, reentry_count="x")  # one malformed fresh sample at the same index
+    sample(16, reentry_count=1, reentry_last=REENTRY)
+    assert tracker.resets and tracker.resets[-1]["reason"] == "backward index without complete wrap"
+    assert not tracker.summary()["reentries"]

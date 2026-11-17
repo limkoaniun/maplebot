@@ -135,6 +135,11 @@ def snapshot_details(bot, snap):
         'rejoin_reason': getattr(circuit, 'rejoin_reason', None),
         'arrival_count': getattr(circuit, 'arrival_count', 0),
         'zone_takeoffs': getattr(circuit, 'zone_takeoffs', 0),
+        # Gap re-entry (route.circuit.gap_reentry) and the take-off-side veto (attack.pre_transition_gap_veto_x).
+        'reentry_count': getattr(circuit, 'reentry_count', 0),
+        'reentry_last': dict(getattr(circuit, 'reentry_last', None) or {}) or None,
+        'reentry_priority_frames': getattr(bot.brain, 'reentry_priority_frames', 0),
+        'gap_veto_frames': getattr(bot.brain, 'gap_veto_frames', 0),
         'loot_state': loot.state if loot is not None else None,
         'player_score': float(fix.score) if fix is not None else None,
         'player_source': fix.source if fix is not None else None,

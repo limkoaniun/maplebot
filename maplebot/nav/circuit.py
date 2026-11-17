@@ -1,11 +1,15 @@
 """A bounded, configurable lap over points in the currently visible minimap."""
 from __future__ import annotations
 
+from collections import namedtuple
 from dataclasses import dataclass
 from copy import deepcopy
 import math
 
 from maplebot.types import Command
+
+# A level gap jump still lining up: flight direction, the source's end on the gap side, source.
+GapTakeoff = namedtuple("GapTakeoff", ("direction", "edge_x", "source"))
 
 
 class ActiveClock:
@@ -170,6 +174,19 @@ class MinimapCircuit:
             raise ValueError("arrive_on_destination and platform_rejoin need a saved editor plan")
         self._arrive_enabled = self.arrive_on_destination and not self.movement_test and has_plan
         self._rejoin_enabled = self.platform_rejoin_enabled and not self.movement_test and has_plan
+        # Opt-in gap re-entry (OFF when absent): a landing walk knocked back across the
+        # level gap it was reached by is re-selected at the walk before that gap jump,
+        # after the same 3-frame proof, instead of waiting out its clock or spending a
+        # rejoin. Nothing else of it is read while ``_reentry_enabled`` is False.
+        gap_reentry = cfg.get("gap_reentry", False)
+        if type(gap_reentry) is not bool:
+            raise ValueError("gap_reentry must be true or false")
+        if gap_reentry and not self.movement_test and not has_plan:
+            raise ValueError("gap_reentry needs a saved editor plan")
+        self.reentry_count = 0      # re-entries this lap; only a completed lap resets it
+        self.reentry_last = None    # {from_index, to_index, platform} of the last one, for status only
+        self.gap_reentry_priority_s = None
+        self.max_gap_reentries_per_lap = None
         self.rejoining = False
         self.platform_rejoin = None  # child circuit while a rejoin runs
         self.rejoin_count = 0
@@ -201,6 +218,17 @@ class MinimapCircuit:
                or (p.right_y is not None and (not math.isfinite(p.right_y) or p.right_y < 0))
                or p.left >= p.right for p in self.platforms):
             raise ValueError("circuit platforms need finite nonnegative y/left/right/right_y with left < right")
+        self._reentry_enabled = gap_reentry and not self.movement_test and has_plan and bool(self.platforms)
+        if self._reentry_enabled:
+            budget = cfg.get("max_gap_reentries_per_lap", 2)
+            if type(budget) is not int or not 1 <= budget <= 5:
+                raise ValueError("max_gap_reentries_per_lap must be an integer from 1 to 5")
+            priority = cfg.get("gap_reentry_priority_s", 1.5)
+            if (not isinstance(priority, (int, float)) or isinstance(priority, bool)
+                    or not math.isfinite(priority) or not 0.5 <= priority <= 3.0):
+                raise ValueError("gap_reentry_priority_s must be finite and between 0.5 and 3.0")
+            self.max_gap_reentries_per_lap = budget
+            self.gap_reentry_priority_s = float(priority)
         self.platform_tolerance_y = float(cfg.get("platform_tolerance_y", 5))
         self.floor_rejoin_s = float(cfg.get("floor_rejoin_s", 0.4))
         if len(self.waypoints) < 2:
@@ -429,6 +457,39 @@ class MinimapCircuit:
         if self.waypoints[self.idx].action == "drop":
             return self._drop_source_y is not None and abs(pos[1] - self._drop_source_y) <= 1
         return True
+
+    @property
+    def gap_reentry_active(self) -> bool:
+        """True only with ``gap_reentry`` on a farming circuit with the saved plan and platforms."""
+        return self._reentry_enabled
+
+    def reentry_pending(self, pos) -> bool:
+        """A gap re-entry would be proven from ``pos`` at the current walk waypoint. Read-only."""
+        return self._reentry_enabled and self._reentry_target(pos) is not None
+
+    def level_gap_takeoff(self):
+        """``GapTakeoff(direction, edge_x, source)`` while a level gap jump is still lining up.
+
+        Only for a jump waypoint in its uncommitted align phase whose saved take-off
+        and landing lie on two different configured platforms that form a level gap
+        (``zones.level_gap``). None otherwise, and always None without platforms,
+        before selection, once completed, blocked, returning, rejoining or terminal.
+        Mutates nothing.
+        """
+        if (not self.platforms or not self._selected or self.completed or self.returning_to_start
+                or self.rejoining or self.recovery_terminal or self.reason is not None):
+            return None
+        point = self.waypoints[self.idx]
+        if point.action != "jump" or self._jump_phase != "align":
+            return None
+        from maplebot.nav.zones import level_gap
+
+        source = self._containing_platform((point.from_x, point.from_y))
+        destination = self._containing_platform((point.x, point.y))
+        if source is None or destination is None or source == destination:
+            return None
+        gap = level_gap(source, destination, point.from_x, point.x)
+        return None if gap is None else GapTakeoff(gap[1], gap[0], source)
 
     def suspend(self, now: float) -> None:
         self._clock.update(now, False)
@@ -782,6 +843,8 @@ class MinimapCircuit:
         if self.idx == len(self.waypoints) - 1:
             self.return_count = 0  # only completing the original lap replenishes its return budget
             self.rejoin_count = 0
+            if self._reentry_enabled:
+                self.reentry_count = 0  # the only reset of the gap re-entry budget
         if not self.loop and self.idx == len(self.waypoints) - 1:
             self.completed = True
             self.state = "completed"
@@ -1426,6 +1489,72 @@ class MinimapCircuit:
             break
         return None
 
+    def _reentry_target(self, pos):
+        """``(walk index, platform id)`` to re-enter after a knock-back across a level gap.
+
+        Pure: nothing is changed. The current waypoint must be a walk on the
+        landing platform of a LEVEL gap jump g (``zones.level_gap``, the jump zone
+        rule's predicate), with only walks on that platform between g and here,
+        and the character must stand strictly on g's take-off platform, the
+        platform of the walk g-1 right before g. Then g-1 is the target. No wrap
+        across waypoint 0, no stair jump, drop, ramp or climb, no ambiguous or
+        unsupported position (e.g. x=89 on the Construction Site right floors),
+        and nothing while blocked, returning, rejoining, terminal, recovering,
+        during a legacy lower-floor rejoin or once the lap's budget is spent.
+        """
+        if (not self._reentry_enabled or not self._selected or self.completed or self.reason is not None
+                or self.returning_to_start or self.rejoining or self.recovery_terminal
+                or self.reentry_count >= self.max_gap_reentries_per_lap
+                or self._recovery_until is not None or self._rejoin_floor is not None
+                or pos is None or self.waypoints[self.idx].action != "walk"):
+            return None
+        expected = self._wp_meta(self.idx).get("platform_id")
+        current = self._strict_platform_id(pos)
+        if expected is None or current is None or current == expected:
+            return None
+        j = self.idx - 1
+        while j >= 1 and self.waypoints[j].action == "walk" and self._wp_meta(j).get("platform_id") == expected:
+            j -= 1
+        if j < 1:
+            return None
+        jump, before = self.waypoints[j], self.waypoints[j - 1]
+        meta = self._wp_meta(j)
+        if (jump.action != "jump" or meta.get("from_platform") != current or meta.get("to_platform") != expected
+                or before.action != "walk" or self._wp_meta(j - 1).get("platform_id") != current):
+            return None
+        source = self._containing_platform((jump.from_x, jump.from_y))
+        destination = self._containing_platform((jump.x, jump.y))
+        if source is None or destination is None:
+            return None
+        from maplebot.nav.zones import level_gap
+
+        if level_gap(source, destination, jump.from_x, jump.x) is None:
+            return None
+        return j - 1, current
+
+    def _do_reentry(self, target_idx: int, platform_id, t: float) -> Command:
+        """Re-select walk ``target_idx`` on ``platform_id``; no input on this frame.
+
+        Like the legacy fall re-selection in ``_walk_floor_ready`` and the
+        arrival hand-over, ``_set_waypoint`` resets retries, ``_rejoin_failed_idx``,
+        the take-off zone (so the jump's first attempt is zoned again), the commit
+        state and the alignment, and starts a fresh ``timeout_s`` window. The
+        Brain's pre-takeoff allowance is keyed on the index and is fresh too.
+        Bound: at most ``max_gap_reentries_per_lap`` re-entries per lap (only a
+        completed lap resets the count); each adds one more selection of walk
+        g-1, jump g and walk g+1, each with its own timeout_s and max_retries:
+        about (15+0.6+15) s each for walk g-1, jump g and the fresh window of
+        the landing walk g+1, plus flight bounds and a frozen pre-fight of up
+        to pre_transition_s, roughly 100 s per re-entry and 200 s per lap at
+        the default of 2 on the Construction Site settings. rejoin_count,
+        return_count, arrival_count and zone_takeoffs are never touched.
+        """
+        self.reentry_count += 1
+        self.reentry_last = {"from_index": self.idx, "to_index": target_idx, "platform": platform_id}
+        self._set_waypoint(target_idx, t)
+        self.state = "reentered"
+        return Command.NONE
+
     def _platform_rejoin_due(self, pos, t: float, expected_id, exclude=()) -> bool:
         """Stably supported on a drawn platform other than the one this waypoint needs."""
         if (not self._rejoin_enabled or self.returning_to_start or self.reason is not None
@@ -1776,9 +1905,17 @@ class MinimapCircuit:
                         self._set_waypoint(ahead[0], t)
                         self.state = "jump_arrived_checking"
                         return Command.NONE
-                elif (self._platform_rejoin_due(pos, t, expected)
-                        and self._begin_platform_rejoin(pos, t, expected)):
-                    return Command.NONE
+                else:
+                    reentry = self._reentry_target(pos) if self._reentry_enabled else None
+                    if reentry is not None:
+                        # Exactly one _offroute_stable call this frame; the rejoin path is
+                        # not evaluated. Until the proof holds, the frame goes on below
+                        # (timeout, recovering, waiting_floor) on the unchanged walk clock.
+                        if self._offroute_stable(pos, reentry[1], t):
+                            return self._do_reentry(reentry[0], reentry[1], t)
+                    elif (self._platform_rejoin_due(pos, t, expected)
+                            and self._begin_platform_rejoin(pos, t, expected)):
+                        return Command.NONE
             else:
                 self._reset_offroute()
         dx = point.x - pos[0]
