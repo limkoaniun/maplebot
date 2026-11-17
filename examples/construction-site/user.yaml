@@ -1103,6 +1103,11 @@ attack:
   # Take-off-side veto at the gap jumps (see config/default.yaml). NOT live-verified; a separate
   # A/B after gap_reentry, never together with it.
   # pre_transition_gap_veto_x: 6
+  # Landing edge band at the three floor gaps (see config/default.yaml). NOT live-verified; A/B it on its
+  # own; it can run with gap_reentry on.
+  # gap_landing_band_x: 8
+  # gap_landing_band_priority_s: 2.5
+  # gap_landing_band_lap_s: 8
 health:
   fixed_rects:
   - - 503

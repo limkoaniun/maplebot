@@ -37,6 +37,8 @@ class LootCollector:
         self._raw_now = None
         self._clock = ActiveClock()
         self._pending = []
+        self.exclusion = None   # (Platform, lo, hi): set each frame by the Brain's landing edge band, else None
+        self.band_skipped = 0   # kill-site candidates discarded inside a band (decisions, not items)
         self.cancel()
 
     def cancel(self):
@@ -60,6 +62,9 @@ class LootCollector:
         """Queue the current goal for one later bounded visit on the same floor."""
         if self.max_pending <= 0 or self.goal is None:
             return
+        if self.exclusion is not None and self._excluded(self.goal, self._platform):
+            self.band_skipped += 1  # never remembered, so it can never evict a site outside the band
+            return
         # A resumed site keeps its first deadline: displacement never renews it.
         deadline = self._deadline if self._deadline is not None else t + self.pending_s
         self._pending = [site for site in self._pending if abs(site[0][0] - self.goal[0]) > self.tolerance_x]
@@ -74,11 +79,38 @@ class LootCollector:
             self._defer(t)
         self._clear_current()
 
+    def _excluded(self, goal, platform) -> bool:
+        """Pure: ``goal`` on ``platform`` lies inside the current landing edge band exclusion."""
+        ex = self.exclusion
+        return ex is not None and goal is not None and platform == ex[0] and ex[1] <= goal[0] <= ex[2]
+
+    def park(self, now) -> int:
+        """Move a begun visit out of the way for one frame of route priority; never starts a visit.
+
+        The begun visit is remembered with its first deadline (when ``max_pending``
+        allows); other remembered sites survive, unlike ``suspend``/``cancel``. The
+        clock is frozen as in ``visual_lock``, so this time never consumes approach,
+        dwell or pending time. Returns 1 when the begun visit was remembered.
+        """
+        t = self._clock.update(now, False)
+        parked = 0
+        if self.goal is not None and self.state in ("settling", "approaching", "dwelling"):
+            goal = self.goal
+            self._defer(t)
+            parked = int(any(site[0] == goal for site in self._pending))
+            self._clear_current()
+        self._reset_approach()
+        return parked
+
     def _next_pending(self, pos, t, platform_bounds):
         """Start the nearest remembered site that is still valid for this floor."""
         self._pending = [site for site in self._pending
                          if t < site[3] and site[1] is not None and platform_bounds is not None
                          and tuple(site[1]) == tuple(platform_bounds)]
+        if self.exclusion is not None:
+            kept = [site for site in self._pending if not self._excluded(site[0], site[2])]
+            self.band_skipped += len(self._pending) - len(kept)
+            self._pending = kept
         if not self._pending:
             return
         site = min(self._pending, key=lambda item: abs(item[0][0] - pos[0]))
@@ -200,6 +232,10 @@ class LootCollector:
         if self.goal is None and self._pending and pos is not None and has_player and not has_detections:
             self._next_pending(pos, t, platform_bounds)
         if self.goal is None:
+            return None
+        if self.exclusion is not None and self._excluded(self.goal, self._platform):
+            self.band_skipped += 1
+            self._clear_current()  # not cancel(): remembered sites outside the band survive
             return None
         off_surface = pos is None or (
             self._platform.support_error(pos) > self.tolerance_y if self._platform is not None

@@ -10,6 +10,9 @@ from maplebot.types import Command
 
 # A level gap jump still lining up: flight direction, the source's end on the gap side, source.
 GapTakeoff = namedtuple("GapTakeoff", ("direction", "edge_x", "source"))
+# The landing floor of a level gap jump, on the walks after that jump: the floor, its own
+# gap-side end, the direction of that end ("left" / "right") and the jump's waypoint index.
+LandingBand = namedtuple("LandingBand", ("platform", "edge_x", "toward", "jump_index"))
 
 
 class ActiveClock:
@@ -187,6 +190,8 @@ class MinimapCircuit:
         self.reentry_last = None    # {from_index, to_index, platform} of the last one, for status only
         self.gap_reentry_priority_s = None
         self.max_gap_reentries_per_lap = None
+        self._landing_bands = {}   # idx -> LandingBand | None, read-only geometry cache
+        self.laps_completed = 0    # completed laps; status, and the Brain's per-lap band cap
         self.rejoining = False
         self.platform_rejoin = None  # child circuit while a rejoin runs
         self.rejoin_count = 0
@@ -490,6 +495,58 @@ class MinimapCircuit:
             return None
         gap = level_gap(source, destination, point.from_x, point.x)
         return None if gap is None else GapTakeoff(gap[1], gap[0], source)
+
+    def landing_band(self):
+        """``LandingBand`` for the current walk when it follows a LEVEL gap jump on its landing floor.
+
+        Read-only geometry for the Brain's landing edge band
+        (``attack.gap_landing_band_x``). None without platforms, in a movement
+        test, before selection, once completed, with a reason, while returning,
+        rejoining or terminal, and at any waypoint that is not a walk. The result
+        for an index is cached; the plan never changes. Mutates nothing else.
+        """
+        if (not self.platforms or self.movement_test or not self._selected or self.completed
+                or self.reason is not None or self.returning_to_start or self.rejoining
+                or self.recovery_terminal or self.waypoints[self.idx].action != "walk"):
+            return None
+        if self.idx not in self._landing_bands:
+            self._landing_bands[self.idx] = self._landing_band_at(self.idx)
+        return self._landing_bands[self.idx]
+
+    def _landing_band_at(self, idx: int):
+        """Pure: the level gap jump this walk's run of same-floor walks follows, as a ``LandingBand``.
+
+        Only walks on the walk's own drawn platform may lie between the jump and
+        ``idx`` (no wrap across waypoint 0). The jump's saved take-off and landing
+        must lie on two different platforms, the landing being this floor, and form
+        a level gap (``zones.level_gap``, the jump zone rule's predicate). The band
+        edge is the landing floor's own gap-side end, not the source edge.
+        """
+        point = self.waypoints[idx]
+        dest = self._containing_platform((point.x, point.y))
+        if dest is None:
+            return None
+        j = idx - 1
+        while (j >= 0 and self.waypoints[j].action == "walk"
+               and self._containing_platform((self.waypoints[j].x, self.waypoints[j].y)) == dest):
+            j -= 1
+        if j < 0:
+            return None
+        jump = self.waypoints[j]
+        if jump.action != "jump":
+            return None
+        source = self._containing_platform((jump.from_x, jump.from_y))
+        landing = self._containing_platform((jump.x, jump.y))
+        if source is None or landing is None or source == landing or landing != dest:
+            return None
+        from maplebot.nav.zones import level_gap
+
+        gap = level_gap(source, landing, jump.from_x, jump.x)
+        if gap is None:
+            return None
+        if gap[1] == "left":
+            return LandingBand(landing, landing.right, "right", j)
+        return LandingBand(landing, landing.left, "left", j)
 
     def suspend(self, now: float) -> None:
         self._clock.update(now, False)
@@ -841,6 +898,7 @@ class MinimapCircuit:
 
     def _advance(self, now: float) -> None:
         if self.idx == len(self.waypoints) - 1:
+            self.laps_completed += 1  # a pure counter: no command or state depends on it here
             self.return_count = 0  # only completing the original lap replenishes its return budget
             self.rejoin_count = 0
             if self._reentry_enabled:

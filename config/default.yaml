@@ -115,6 +115,21 @@ attack:
   #                            # side keeps the fight. Never on stairs, ramps, drops, ropes, stair jumps or
   #                            # rejoin/return routes. Counted as gap_veto_frames. Offline-tested only, NOT
   #                            # live-verified; A/B it separately from route.circuit.gap_reentry.
+  # gap_landing_band_x: false     # absent/null/false = off. Otherwise 2-12 minimap px. After a LEVEL gap
+  #                               # jump (the take-off zone rule's level gap), on the walks that follow it on
+  #                               # its landing floor, the last X px before that floor's gap-side end form
+  #                               # an edge band: combat walking and pursuit never step toward the edge within
+  #                               # 1 px of it (face + attack in place instead), kill sites in the band are
+  #                               # not looted, and while the character stands in the band and the route is
+  #                               # not walking toward the edge the route alone is stepped (no fight, no loot
+  #                               # start; begun outside visits are kept for later) for at most
+  #                               # gap_landing_band_priority_s (2.5; 0 = no priority, filters only;
+  #                               # 0.5-4) per waypoint selection and gap_landing_band_lap_s (8; up to 20) per
+  #                               # lap. No new attack or target; HP protection unchanged. Never on stairs,
+  #                               # ramps, drops, ropes, take-off floors or return/rejoin routes. Costs
+  #                               # collection of drops in the band. Counted under 'edge_band' in the
+  #                               # status. Offline-tested only, NOT live-verified; A/B it on its own; it can
+  #                               # run with route.circuit.gap_reentry on. Needs the saved editor plan.
 
 # Optional loot keys (the `loot:` section is absent by default; see maplebot/nav/loot.py):
 #   walk_speed_x: 0    minimap px/s while a key is held, as an upper bound. > 0 sizes each leased

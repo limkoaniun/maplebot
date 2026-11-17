@@ -1,6 +1,7 @@
 """Per-frame decision: route or sweep, combat override, stuck recovery."""
 from __future__ import annotations
 
+from collections import namedtuple
 from dataclasses import dataclass, field, replace
 import math
 
@@ -10,6 +11,18 @@ from maplebot.nav.stuck import StuckDetector
 from maplebot.nav.circuit import MinimapCircuit
 from maplebot.nav.loot import LootCollector
 from maplebot.types import Command, Detection
+
+# The landing edge band of one decided frame (attack.gap_landing_band_x): the landing floor,
+# its gap-side end, the band's inner line, the direction of the edge, the gap jump's index,
+# whether the character is supported on that floor / inside the band, whether the route is
+# not walking it toward the edge, and the loot exclusion interval [lo, hi].
+EdgeBand = namedtuple("EdgeBand", ("platform", "edge_x", "inner_x", "toward", "jump_index", "on",
+                                   "inside", "route_out", "lo", "hi"))
+BAND_ENTRY_MARGIN_X = 1.0   # the same 1 px inset pursuit keeps inside a drawn floor
+
+
+def _finite_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 @dataclass
@@ -77,6 +90,48 @@ class Brain:
                              "or false")
         else:
             self._gap_veto_x = float(veto)
+        # Opt-in landing edge band (absent, null or false = off): on the walks after a
+        # LEVEL gap jump, on its landing floor, the last X minimap px before that floor's
+        # gap-side end. Combat and pursuit never step toward the edge there, kill sites in
+        # it are not looted, and a bounded window steps the route alone to walk out.
+        band = self.attack_cfg.get("gap_landing_band_x")
+        self._band_priority_s = self._band_lap_s = None
+        if band is None or band is False:
+            self._band_x = None
+        elif not _finite_number(band) or not 2 <= band <= 12:
+            raise ValueError("attack.gap_landing_band_x must be a finite number from 2 to 12 minimap px, or false")
+        else:
+            self._band_x = float(band)
+            if (self.circuit is not None and not self.movement_test
+                    and not isinstance(circuit_cfg.get("editor_plan"), dict)):
+                raise ValueError("attack.gap_landing_band_x needs a saved editor plan")
+            priority = self.attack_cfg.get("gap_landing_band_priority_s", 2.5)
+            if not _finite_number(priority) or not (priority == 0 or 0.5 <= priority <= 4.0):
+                raise ValueError("attack.gap_landing_band_priority_s must be 0 (off) or finite between 0.5 and 4.0 s")
+            self._band_priority_s = float(priority)
+            if self._band_priority_s > 0:
+                lap = self.attack_cfg.get("gap_landing_band_lap_s", 8.0)
+                if not _finite_number(lap) or not self._band_priority_s <= lap <= 20:
+                    raise ValueError("attack.gap_landing_band_lap_s must be finite, at least "
+                                     "gap_landing_band_priority_s and at most 20 s")
+                self._band_lap_s = float(lap)
+        self._band = None
+        self._band_inside = False
+        self._band_spent = 0.0
+        self._band_lap_spent = 0.0
+        self._band_lap_key = None
+        # Status counters: decisions, never kills, items or prevented knocks.
+        self.edge_band_frames = 0
+        self.edge_band_inside_s = 0.0
+        self.edge_band_brain_frames = 0
+        self.edge_band_route_dwell_s = 0.0
+        self.edge_band_window_frames = 0
+        self.edge_band_window_s = 0.0
+        self.edge_band_windows_spent = 0
+        self.edge_band_move_clamps = 0
+        self.edge_band_pursuit_blocks = 0
+        self.edge_band_visits_parked = 0
+        self.edge_band_last = None
         self.gap_veto_frames = 0
         # route.circuit.gap_reentry: a bounded window per waypoint selection in which a
         # pending re-entry is stepped before combat and loot (see decide()).
@@ -220,6 +275,18 @@ class Brain:
         expanded = dict(self.attack_cfg)
         expanded["range_x"] = int(expanded["range_x"]) + max(0, int(expanded.get("search_margin", 50)))
         candidates = []
+        low, high = platform.left + 1, platform.right - 1
+        band = self._band
+        if band is not None and band.on and band.platform == platform:
+            # Landing edge band: never chase a target into it. Only a candidate toward
+            # the edge is bounded; a pursuit away from the edge is today's pursuit.
+            if band.toward == "right":
+                high = min(high, band.inner_x - BAND_ENTRY_MARGIN_X)
+            else:
+                low = max(low, band.inner_x + BAND_ENTRY_MARGIN_X)
+        else:
+            band = None
+        blocked = False
         for det in p.detections:
             dx = det.box.center[0] - p.player[0]
             target_x = p.minimap_pos[0] + dx / self.loot.scale
@@ -227,7 +294,14 @@ class Brain:
             # ordinary vertical attack band so an adjacent ledge is not chased.
             if (abs(dx) <= expanded["range_x"] and platform.left + 1 <= target_x <= platform.right - 1
                     and choose_target([det], p.player, expanded, self.min_area, p.frame_w, p.frame_h) is not None):
-                candidates.append(det)
+                # The same side test as the pursuit direction below.
+                toward_edge = band is not None and ("left" if dx < 0 else "right") == band.toward
+                if not toward_edge or low <= target_x <= high:
+                    candidates.append(det)
+                else:
+                    blocked = True  # excluded only by the band's narrowed bound
+        if blocked:
+            self.edge_band_pursuit_blocks += 1
         if candidates:
             det = min(candidates, key=lambda d: abs(d.box.center[0] - p.player[0])
                       + abs(d.box.center[1] - p.player[1]))
@@ -261,7 +335,13 @@ class Brain:
         if key != self._pre_key:
             self._pre_key, self._pre_spent = key, 0.0  # next waypoint, or a return began/ended
             self._reentry_spent = 0.0  # the re-entry priority window is per waypoint selection too
+            self._band_spent = 0.0  # and so is the landing edge band's walk-out window
             self._end_pre_fight()
+        if self._band_x is not None:
+            # The band's lap allowance: only a completed lap or another circuit object resets it.
+            lap_key = None if nav is None else (id(nav), nav.laps_completed)
+            if lap_key != self._band_lap_key:
+                self._band_lap_key, self._band_lap_spent = lap_key, 0.0
 
     def _pre_transition_fight(self, p: Perception) -> Command | None:
         """Command for a frame of a pre-takeoff fight, or None when the circuit steps.
@@ -375,6 +455,12 @@ class Brain:
         if platform is not None and ((move_x == "left" and p.minimap_pos[0] <= platform.left)
                                      or (move_x == "right" and p.minimap_pos[0] >= platform.right)):
             move_x = "none"
+        band = self._band
+        if (band is not None and band.on and move_x == band.toward
+                and (p.minimap_pos[0] >= band.inner_x - BAND_ENTRY_MARGIN_X if band.toward == "right"
+                     else p.minimap_pos[0] <= band.inner_x + BAND_ENTRY_MARGIN_X)):
+            move_x = "none"  # landing edge band: face and attack in place, as in the deadzone
+            self.edge_band_move_clamps += 1
         move_y = cmd.move_y if p.on_ladder else "none"
         face_x = target if move_x == "none" and target in ("left", "right") else "none"
         return Command(move_x, move_y, action, face_x=face_x)
@@ -388,7 +474,47 @@ class Brain:
 
     # -- main entry ----------------------------------------------------
     def decide(self, p: Perception) -> Command:
+        cmd = self._decide(p)
+        if self._band_inside:
+            if not self.state.startswith("circuit_"):
+                self.edge_band_brain_frames += 1  # residual Brain-owned exposure in the band
+            elif self.state == "circuit_dwelling":
+                self.edge_band_route_dwell_s += self._frame_dt  # route-owned exposure (a stop in the band)
+        return cmd
+
+    def _edge_band(self, p: Perception):
+        """The landing edge band of this frame (``EdgeBand``), or None. Read-only.
+
+        Only on a plain selected walk after a LEVEL gap jump, on its landing floor
+        (``MinimapCircuit.landing_band``), and only when that floor is at least twice
+        the band width. Membership is the ordinary ``_supported_combat_platform``
+        test (tolerance_y), so one-pixel height jitter on the floor is covered.
+        ``route_out``: the route's own target is not further toward the edge than
+        the character, beyond the walk tolerance (it walks away or dwells).
+        """
+        land = self.circuit.landing_band()
+        if land is None or p.minimap_pos is None:
+            return None
+        platform = land.platform
+        if platform.right - platform.left < 2 * self._band_x:
+            return None
+        x = p.minimap_pos[0]
+        right = land.toward == "right"
+        inner = land.edge_x - self._band_x if right else land.edge_x + self._band_x
+        tol = self.loot.tolerance_x
+        lo, hi = (inner - tol, land.edge_x) if right else (land.edge_x, inner + tol)
+        on = self._supported_combat_platform(p) == platform
+        inside = on and (x >= inner if right else x <= inner)
+        point = self.circuit.waypoints[self.circuit.idx]
+        route_out = ((point.x - x <= self.circuit.tolerance_x) if right
+                     else (x - point.x <= self.circuit.tolerance_x))
+        return EdgeBand(platform, land.edge_x, inner, land.toward, land.jump_index, on, inside, route_out, lo, hi)
+
+    def _decide(self, p: Perception) -> Command:
         self._track_frame(p)
+        self._band, self._band_inside = None, False
+        if self._band_x is not None:
+            self.loot.exclusion = None
         if self.circuit is not None and (self.movement_test or self.circuit.completed
                 or self.circuit.state == "blocked"
                 or getattr(self.circuit, "returning_to_start", False)
@@ -446,6 +572,39 @@ class Brain:
             cmd = nav.step(p.minimap_pos, p.now, p.on_ladder)
             self.state = "circuit_" + nav.state
             return cmd
+        if self._band_x is not None and nav is not None:
+            band = self._band = self._edge_band(p)
+            if band is not None:
+                self.loot.exclusion = (band.platform, band.lo, band.hi)
+                if band.inside:
+                    self._band_inside = True
+                    self.edge_band_frames += 1
+                    self.edge_band_inside_s += self._frame_dt
+                    self.edge_band_last = {"index": nav.idx, "jump_index": band.jump_index,
+                                           "edge_x": band.edge_x, "inner_x": band.inner_x,
+                                           "x": p.minimap_pos[0], "window": False}
+                    if (self._band_priority_s and band.route_out
+                            and self._band_spent < self._band_priority_s
+                            and self._band_lap_spent < self._band_lap_s):
+                        # Standing in the band while the route walks away from the edge
+                        # (or dwells): for a bounded, clock-charged window per waypoint
+                        # selection and per lap the route alone is stepped, never
+                        # suspended. No attack, no movement of our own, no loot start; a
+                        # begun visit outside the band is remembered for later.
+                        self._band_spent += self._frame_dt
+                        self._band_lap_spent += self._frame_dt
+                        self.edge_band_window_frames += 1
+                        self.edge_band_window_s += self._frame_dt
+                        if (self._band_spent >= self._band_priority_s
+                                or self._band_lap_spent >= self._band_lap_s):
+                            self.edge_band_windows_spent += 1
+                        self.edge_band_last["window"] = True
+                        self._clear_combat_memory()
+                        self._pursuit_seen = None
+                        self.edge_band_visits_parked += self.loot.park(p.now)
+                        cmd = nav.step(p.minimap_pos, p.now, p.on_ladder)
+                        self.state = "circuit_" + nav.state
+                        return cmd
         target = self._choose_target(p)
         if target is not None and (self.circuit is not None or self.state != "recovering"):
             self._remember_target(p, target)
