@@ -947,6 +947,21 @@ class Bot:
         self._stop = True
 
 
+def map_profile_root():
+    """The folder whose config/map_profiles holds the saved profiles: the checkout in source
+    mode, the folder beside Maplebot.exe when frozen (never _internal)."""
+    from maplebot.paths import app_root
+    return app_root()
+
+
+def load_map_recognizer(cfg: dict):
+    from maplebot.map_profiles import MapProfileRecognizer, load_profiles
+    options = cfg.get("map_profile", {})
+    profiles = load_profiles(map_profile_root(), directory=options.get("directory"))
+    recognition = options.get("recognition", {})
+    return MapProfileRecognizer(profiles, **recognition)
+
+
 def build_bot(cfg: dict, source_path: str | None, no_input: bool) -> Bot:
     """Wire a Bot from config: source (window / image / video), keyboard, monsters, route."""
     if source_path:
@@ -990,12 +1005,7 @@ def build_bot(cfg: dict, source_path: str | None, no_input: bool) -> Bot:
             log.info("no route configured: sweep search mode")
     bot = Bot(cfg, source, keyboard, library, route_map)
     if not source_path:
-        from pathlib import Path
-        from maplebot.map_profiles import MapProfileRecognizer, load_profiles
-        options = cfg.get("map_profile", {})
-        profiles = load_profiles(Path(__file__).resolve().parents[1], directory=options.get("directory"))
-        recognition = options.get("recognition", {})
-        bot.map_recognizer = MapProfileRecognizer(profiles, **recognition)
+        bot.map_recognizer = load_map_recognizer(cfg)
         bot.map_ready = False
         bot.pause_all()
     return bot

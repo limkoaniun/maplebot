@@ -6,8 +6,9 @@ import os
 from typing import Any
 
 import yaml
+from maplebot.paths import app_root, is_frozen
 
-PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGE_ROOT = os.fspath(app_root()) if is_frozen() else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG_PATH = os.path.join(PACKAGE_ROOT, "config", "default.yaml")
 
 
