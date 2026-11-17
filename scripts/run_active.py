@@ -112,6 +112,15 @@ def snapshot_details(bot, snap):
         'health_protection_state': bot.health_protection.state if bot.health_protection is not None else 'idle',
         'health_protection_reason': bot.health_protection.reason if bot.health_protection is not None else None,
         'health_protection_taps': bot.keyboard.hp_taps_sent if bot.keyboard is not None else 0,
+        # Diagnostics only: HP rises seen after sent presses, and why a latch fired. Never a control input.
+        'health_protection_responses': bot.health_protection.responses_confirmed if bot.health_protection is not None else None,
+        'health_protection_diagnosis': bot.health_protection.diagnosis if bot.health_protection is not None else None,
+        'health_protection_diagnosis_detail': bot.health_protection.diagnosis_detail if bot.health_protection is not None else None,
+        'mp_taps_sent': getattr(bot.keyboard, 'mp_taps_sent', None) if bot.keyboard is not None else None,
+        'mp_presses_unanswered': bot.health.mp_presses_unanswered,
+        'mp_presses_unknown': bot.health.mp_presses.presses_unknown if bot.health.mp_sent_counter is not None else None,
+        # Keyboard delivery counters (granted = pressed + expired + superseded + pending; 'fine' = circuit fine taps).
+        'keyboard_pulses': bot.keyboard.pulse_stats() if bot.keyboard is not None and hasattr(bot.keyboard, 'pulse_stats') else None,
         'returning_to_start': bool(circuit is not None and circuit.returning_to_start),
         'recovery_state': circuit.recovery_state if circuit is not None else 'idle',
         'recovery_reason': getattr(bot, '_return_request_error', None) or (circuit.recovery_reason if circuit is not None else None),
@@ -339,6 +348,8 @@ def run():
             session, keep_paused, waiting = None, True, False
             continue
         bot.keyboard.backend = CountedBackend(bot.keyboard.backend, counts)
+        # MP observation (diagnostic only) counts real MP key-downs from the keyboard worker.
+        bot.health.mp_sent_counter = (lambda kb=bot.keyboard: kb.mp_taps_sent) if hasattr(bot.keyboard, 'mp_taps_sent') else None
         # One session's observations survive a reload or test; counts made under different evidence
         # settings are kept in final['evidence_previous'] instead of being dropped.
         bot.evidence = evidence_tracker = carry_over_tracker(

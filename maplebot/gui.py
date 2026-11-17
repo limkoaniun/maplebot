@@ -114,9 +114,20 @@ def _health_protection_display(status):
     startup = _startup_return_display(status)
     if startup and startup[1] not in detail:
         detail = startup[1] + " " + detail
+    diagnosis = str(status.get("health_protection_diagnosis_detail") or "").strip()
+    if state == "needs_attention" and diagnosis and diagnosis not in detail:
+        detail += " " + diagnosis
     taps = status.get("health_protection_taps")
     if isinstance(taps, int) and not isinstance(taps, bool) and taps > 0:
         detail += f" HP potion key presses: {taps}; a key press does not confirm HP restoration."
+        responses = status.get("health_protection_responses")
+        # One rise can answer several presses, so this counts rises, not presses.
+        # A zero while healing only means the first response window is still open.
+        if (isinstance(responses, int) and not isinstance(responses, bool) and 0 <= responses <= taps
+                and (responses > 0 or state == "needs_attention")):
+            rises = f"{responses} HP rise" + (" was" if responses == 1 else "s were")
+            presses = f"{taps} sent press" + ("" if taps == 1 else "es")
+            detail += f" {rises} observed after {presses}."
     return label, detail
 
 

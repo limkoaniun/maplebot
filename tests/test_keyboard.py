@@ -660,8 +660,9 @@ def test_precision_movement_expires_on_worker_clock_without_a_new_frame():
     kb, be, wall = _leased_keyboard(keys={"pickup": "x"})
     kb.set_command(Command("right", "up", valid_for_s=.1),
                    source_time=wall[0], navigation_only=True)
-    deadline = kb._command_deadline
     kb.apply_once(0)
+    deadline = kb._command_deadline  # the pulse's own length runs from its key-down
+    assert deadline == pytest.approx(10.1)
     assert be.held == {"right", "up"}
     for tick in (10.025, 10.05, 10.075, 10.099):
         wall[0] = tick
@@ -689,8 +690,8 @@ def test_precision_lease_uses_shortest_command_argument_watchdog_and_source_limi
     kb, be, wall = _leased_keyboard(safety={"command_timeout_s": watchdog})
     kb.set_command(Command("left", valid_for_s=command_limit),
                    source_time=wall[0]-frame_age, valid_for_s=explicit_limit)
+    kb.apply_once(0)  # key-down at the grant time
     assert kb._command_deadline == pytest.approx(10+expected)
-    kb.apply_once(0)
     assert be.held == {"left"}
     wall[0] = 10+expected+.00001
     kb.apply_once(0)
@@ -766,8 +767,8 @@ def test_same_capture_repeat_of_leased_command_does_not_extend_pulse():
     captured = wall[0]
     pulse = Command("right", valid_for_s=.119)
     kb.set_command(pulse, source_time=captured, navigation_only=True)
-    assert kb._command_deadline == pytest.approx(10.119)
     kb.apply_once(0)
+    assert kb._command_deadline == pytest.approx(10.119)
     assert be.held == {"right"}
     wall[0] = 10.09  # vision work between the two sends of one Bot.step
     kb.set_command(pulse, source_time=captured, navigation_only=True)
@@ -779,13 +780,19 @@ def test_same_capture_repeat_of_leased_command_does_not_extend_pulse():
     assert not be.held and kb.cmd == Command.NONE
 
 
-@pytest.mark.parametrize("second,expected", [(.5, 10.119), (.01, 10.1)])
-def test_same_capture_repeat_with_other_lifetime_only_shortens(second, expected):
+@pytest.mark.parametrize("pressed_first", [True, False])
+@pytest.mark.parametrize("second,length", [(.5, .119), (.01, .01)])
+def test_same_capture_repeat_with_other_lifetime_only_shortens(second, length, pressed_first):
     kb, _, wall = _leased_keyboard()
     captured = wall[0]
     kb.set_command(Command("right", valid_for_s=.119), source_time=captured)
+    if pressed_first:
+        kb.apply_once(0)  # running since 10.0: a repeat may only pull its end in
     wall[0] = 10.09
     kb.set_command(Command("right", valid_for_s=second), source_time=captured)
+    kb.apply_once(0)
+    # Not yet pressed: the shorter length runs from the key-down at 10.09.
+    expected = min(10.119, 10.09 + second) if pressed_first else 10.09 + length
     assert kb._command_deadline == pytest.approx(expected)
     assert kb.cmd.valid_for_s == second
 
@@ -806,20 +813,31 @@ def test_same_capture_repeat_cannot_restart_a_pulse_the_worker_already_expired()
     assert be.events == events and not be.held
 
 
-def test_same_capture_other_command_takes_effect_and_cannot_rearm_first_pulse():
+@pytest.mark.parametrize("first_pressed", [True, False])
+def test_same_capture_other_command_takes_effect_and_cannot_rearm_first_pulse(first_pressed):
     kb, be, wall = _leased_keyboard()
     captured = wall[0]
     kb.set_command(Command("right", valid_for_s=.119), source_time=captured)
+    if first_pressed:
+        kb.apply_once(0)
+        assert be.held == {"right"}
     wall[0] = 10.05
     kb.set_command(Command("left", valid_for_s=.1), source_time=captured)
-    assert kb._command_deadline == pytest.approx(10.15)
     kb.apply_once(0)
+    assert kb._command_deadline == pytest.approx(10.15)
     assert be.held == {"left"}
     wall[0] = 10.06
     kb.set_command(Command.NONE, source_time=captured)  # unleased: full watchdog lease
     assert kb._command_deadline == pytest.approx(10.75)
     kb.set_command(Command("right", valid_for_s=.119), source_time=captured)
-    assert kb._command_deadline == pytest.approx(10.119)
+    kb.apply_once(0)
+    if first_pressed:
+        # The pulse already ran from 10.0 for this capture: never re-armed.
+        assert kb._command_deadline == pytest.approx(10.119)
+    else:
+        # It never went down, so it spent nothing; it still gets only its own length.
+        assert kb._command_deadline == pytest.approx(10.06 + .119)
+    assert be.held == {"right"}
 
 
 def test_new_capture_renews_equal_leased_command():
@@ -859,6 +877,7 @@ def test_unstamped_leased_repeat_still_renews():
     kb, _, wall = _leased_keyboard()
     pulse = Command("right", valid_for_s=.1)
     kb.set_command(pulse)
+    kb.apply_once(0)
     wall[0] = 10.05
     kb.set_command(pulse)  # no capture identity, so nothing to deduplicate
     assert kb._command_deadline == pytest.approx(10.15)
@@ -883,4 +902,5 @@ def test_mode_change_clears_stored_capture_stamp(clear):
         kb.is_active = lambda: True
     assert kb._command_source_time is None and not kb._pulse_deadlines
     kb.set_command(pulse, source_time=captured, navigation_only=True)
+    kb.apply_once(0)
     assert kb._command_deadline == pytest.approx(10.169)  # an ordinary fresh lease
