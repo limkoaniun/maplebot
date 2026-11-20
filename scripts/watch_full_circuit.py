@@ -53,10 +53,28 @@ def can_approach_start(status, circuit):
         return True
     if not status.get('minimap_seen'):
         return False
-    from maplebot.nav.recovery import plan_return_to_start
+    from maplebot.nav.recovery import UnsupportedPosition, plan_return_to_start
+    pos = status.get('minimap')
     try:
-        plan_return_to_start(circuit, status.get('minimap'))
+        plan_return_to_start(circuit, pos)
+        return True
+    except UnsupportedPosition:
+        pass  # the controller may first regain support; checked below
     except (ValueError, TypeError, KeyError):
+        return False
+    # May-attempt check only: the runtime still proves the landing before it plans.
+    try:
+        if circuit.get('return_regain_support', True) is not True:
+            return False
+        from maplebot.nav.regain import regain_options
+        options = regain_options(circuit, pos)
+        if not options:
+            return False
+        platform = next(p for p in circuit['editor_plan']['platforms']
+                        if p['id'] == options[0]['platform_id'])
+        px = min(max(pos[0], platform['left']), platform['right'])
+        plan_return_to_start(circuit, (px, platform_surface(platform).y_at(px)))
+    except (ValueError, TypeError, KeyError, StopIteration):
         return False
     return True
 
@@ -106,7 +124,9 @@ def preflight(bridge, *, require_foreground=False):
         raise ValueError("The saved circuit must contain the expected 17 platform transitions.")
     if (points[0].get("platform_id") != "ground" or points[0].get("action", "walk") != "walk"
             or (points[0]["x"], points[0]["y"]) != (49, 105) or not can_approach_start(status, circuit)):
-        raise ValueError("The character needs the saved ground platform or a mapped return path to point 1 (49,105).")
+        raise ValueError("The character needs the saved ground platform, a mapped return path, or a position "
+                         "the controller can first walk or climb down from onto a drawn platform, "
+                         "to reach point 1 (49,105).")
     if (status.get("return_count", 0) != 0 or status.get("returning_to_start")
             or status.get("recovery_terminal") or status.get("editor_test") or status.get("potion_test")):
         raise ValueError("No recovery or movement/potion test may be active at the start.")
@@ -212,6 +232,28 @@ class CaptureContinuity:
         return self.missing_since is not None and now-self.missing_since >= 2
 
 
+def _status_index(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def reentry_count(status):
+    """The controller's per-lap gap re-entry count, or None when absent or malformed."""
+    return _status_index(status.get("reentry_count"))
+
+
+def reentry_last(status):
+    """The last published re-entry {from_index, to_index, platform}, or None when malformed."""
+    value = status.get("reentry_last")
+    if not isinstance(value, dict):
+        return None
+    source, target = _status_index(value.get("from_index")), _status_index(value.get("to_index"))
+    if source is None or target is None or target >= source:
+        return None
+    platform = value.get("platform")
+    return {"from_index": source, "to_index": target,
+            "platform": platform if isinstance(platform, str) else None}
+
+
 class LapEvidence:
     """Forward progress and landing observations; recovery resets never count as wraps."""
     def __init__(self, circuit):
@@ -225,9 +267,18 @@ class LapEvidence:
         self.last_startup = None
         self.startup_active = False
         self.max_return_count = 0
+        self.max_rejoin_count = 0
+        self.arrival_base = None
+        self.max_arrival_count = 0
+        self.zone_base = None
+        self.max_zone_takeoffs = 0
         self.recovery_active = False
         self.last_recovery = None
         self.last_updated = None
+        # Gap re-entry (route.circuit.gap_reentry): the controller's own backward step
+        # to an already observed take-off. None until a fresh sample publishes a count.
+        self.last_reentry_count = None
+        self.reentries = []
         self.wrap = False
         self.reset_progress()
 
@@ -252,6 +303,11 @@ class LapEvidence:
         if updated == self.last_updated or not fresh(status):
             return
         self.last_updated = updated
+        # Exactly one re-entry since the previous fresh sample, or nothing to accept.
+        reentries = reentry_count(status)
+        reentry_step = (reentries is not None and self.last_reentry_count is not None
+                        and reentries == self.last_reentry_count+1)
+        self.last_reentry_count = reentries
         startup = str(status.get("startup_return_state") or "idle")
         if startup != self.last_startup:
             if startup != "idle":
@@ -281,6 +337,16 @@ class LapEvidence:
             self.resets.append({"updated": updated, "reason": "recovery", "observed_indices": list(self.observed)})
             self.reset_progress()
         self.max_return_count = max(count, self.max_return_count)
+        # Reported only: none of these values changes what counts as a verified lap.
+        self.max_rejoin_count = max(int(status.get("rejoin_count") or 0), self.max_rejoin_count)
+        arrivals = int(status.get("arrival_count") or 0)
+        if self.arrival_base is None:
+            self.arrival_base = arrivals
+        self.max_arrival_count = max(arrivals, self.max_arrival_count)
+        zones = int(status.get("zone_takeoffs") or 0)
+        if self.zone_base is None:
+            self.zone_base = zones
+        self.max_zone_takeoffs = max(zones, self.max_zone_takeoffs)
         self.recovery_active = recovery
         if recovery:
             return
@@ -294,6 +360,14 @@ class LapEvidence:
         elif index != self.previous:
             if self.previous == self.last and index == 0 and count == 0:
                 self.wrap = True
+            elif (index < self.previous and reentry_step
+                  and (step := reentry_last(status)) is not None
+                  and step["from_index"] == self.previous and step["to_index"] == index
+                  and index in self.observed):
+                # The controller re-ran a gap jump from its own observed take-off.
+                # Progress and landing proofs stand; the wrap still needs them all.
+                self.reentries.append({"updated": updated, "from": self.previous, "to": index,
+                                       "platform": step["platform"]})
             elif index < self.previous:
                 self.resets.append({"updated": updated, "reason": "backward index without complete wrap",
                                     "previous": self.previous, "index": index, "observed_indices": list(self.observed)})
@@ -321,11 +395,17 @@ class LapEvidence:
                     for t in self.landings]
         return {"full_wrap_observed": self.wrap, "observed_indices": self.observed,
                 "unobserved_forward_indices": sorted(set(self.skipped)), "attempt_resets": self.resets,
+                "reentries": deepcopy(self.reentries),
                 "transitions": landings, "all_transition_indices_observed": all(t["index_observed"] for t in landings),
                 "all_landings_observed": all(t["confirmed"] for t in landings),
                 "stable_ground_return": self.ground_proof.confirmed,
                 "ground_samples": self.ground_proof.samples, "recovery_events": self.recovery_events,
-                "startup_events": self.startup_events, "maximum_return_count": self.max_return_count}
+                "startup_events": self.startup_events, "maximum_return_count": self.max_return_count,
+                # A jump accepted by destination proof was not flown: say so next to the landings.
+                "maximum_rejoin_count": self.max_rejoin_count,
+                "arrivals_without_takeoff": self.max_arrival_count - (self.arrival_base or 0),
+                # Take-offs made from a zone, outside the saved spot's own tolerance (takeoff_zones).
+                "maximum_zone_takeoffs": self.max_zone_takeoffs - (self.zone_base or 0)}
 
 
 def evidence_images(log, folder):

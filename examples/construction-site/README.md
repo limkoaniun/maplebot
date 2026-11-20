@@ -1,6 +1,6 @@
 # Construction Site handoff snapshot
 
-This is the measured player / Double Stab setup from the 15 November 2026 handoff. It preserves the 44-point circuit, 17 transitions, map reference, keys, monster calibration, and HP/MP/loot settings for development. These files are not automatically loaded.
+This is the measured Double Stab character setup from the 15 November 2026 handoff. It preserves the 44-point circuit, 17 transitions, map reference, keys, monster calibration, and HP/MP/loot settings for development. These files are not automatically loaded.
 
 The live controller uses `config/user.yaml` and `config/map_profiles/`. On the original PC those already exist: **use them as-is** unless deliberately restoring this snapshot. Changes made after this handoff may be newer than the example.
 

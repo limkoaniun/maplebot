@@ -164,3 +164,36 @@ def test_invalid_lap_target_rejected_before_preflight_or_requests(tmp_path, targ
     with pytest.raises(ValueError, match="target_laps"):
         watch.watch(object(), tmp_path / "watch.jsonl", target_laps=target)
     assert not (tmp_path / "watch.jsonl").exists()
+
+
+def test_lap_with_published_reentry_completes_and_next_lap_starts_clean(samples):
+    laps, sample = samples
+    step = {"from_index": 18, "to_index": 16, "platform": "floor-3-right"}
+    for number in (1, 2):
+        for index in range(19):
+            for _ in range(3):
+                sample(index, reentry_count=0)
+        sample(16, reentry_count=1, reentry_last=step)
+        for index in range(16, 44):
+            for _ in range(3):
+                sample(index, reentry_count=1, reentry_last=step)
+        completed = sample(0, reentry_count=0, reentry_last=step)
+        assert completed["lap"] == number and laps.error is None
+        assert completed["all_landings_observed"] and completed["stable_ground_return"]
+        assert not completed["attempt_resets"]
+        assert [(r["from"], r["to"], r["platform"]) for r in completed["reentries"]] == [(18, 16, "floor-3-right")]
+        assert laps.current.observed == [0] and laps.current.reentries == []
+
+
+def test_backward_step_without_reentry_fields_still_resets_the_lap(samples):
+    laps, sample = samples
+    for index in range(19):
+        sample(index)
+    sample(16)
+    fill_lap(sample)
+    sample(0)
+    assert laps.error is None and len(laps.completed) == 1
+    resets = laps.completed[0]["attempt_resets"]
+    assert [(r["reason"], r["previous"], r["index"]) for r in resets] == [
+        ("backward index without complete wrap", 18, 16)]
+    assert laps.completed[0]["reentries"] == []

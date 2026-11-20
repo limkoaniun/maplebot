@@ -1,13 +1,13 @@
 """Native desktop settings and status panel for the local Maplebot runner."""
 from __future__ import annotations
 
+import copy
 import ctypes
 import json
 import math
 import os
 from pathlib import Path
 import subprocess
-import sys
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -16,10 +16,49 @@ import yaml
 import cv2
 
 from maplebot.config import load_config
+from maplebot import first_run, launcher, paths
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = paths.app_root()
 USER_CONFIG = ROOT / "config/user.yaml"
 LOG = ROOT / "log"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _import_character_image(root, source) -> str:
+    """Copy a chosen PNG into <root>/assets and return its relative "assets/<name>" path.
+
+    Refuses a non-PNG, a non-ASCII file name (OpenCV opens narrow paths on Windows) and a
+    different file that already uses the same name in assets/. Never overwrites a file.
+    """
+    root, source = Path(root), Path(source)
+    if source.suffix.lower() != ".png" or not source.is_file():
+        raise ValueError("Choose a PNG image file.")
+    with open(source, "rb") as handle:
+        if handle.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE:
+            raise ValueError(f"{source.name} is not a PNG image.")
+    if not source.name.isascii():
+        raise ValueError("Rename the image so its name uses only English letters, digits, '-' or '_', then choose it again.")
+    assets = root / "assets"
+    relative = f"assets/{source.name}"
+    try:
+        if source.resolve().parent == assets.resolve():
+            return relative
+    except OSError:
+        pass
+    assets.mkdir(parents=True, exist_ok=True)
+    destination = assets / source.name
+    data = source.read_bytes()
+    if destination.exists():
+        if destination.read_bytes() == data:
+            return relative
+        raise ValueError(f"A different image named {source.name} is already in the assets folder. "
+                         "Rename your image and choose it again.")
+    try:
+        with open(destination, "xb") as handle:
+            handle.write(data)
+    except FileExistsError:
+        raise ValueError(f"An image named {source.name} was just added to the assets folder; choose it again.") from None
+    return relative
 
 
 def _read_user() -> dict:
@@ -36,6 +75,32 @@ def _set(data: dict, path: str, value) -> None:
     for piece in pieces[:-1]:
         data = data.setdefault(piece, {})
     data[pieces[-1]] = value
+
+
+# Keys that every Save & apply writes from the form (see _validated), besides the entry fields
+# in SettingsWindow.values. If another writer changes one of them after the form was loaded
+# (maplebot-cli import-settings or restore-example, a hand edit), saving the stale form would
+# silently put the old values back, including keys.hp_potion and the HP thresholds.
+FORM_EXTRA_KEYS = ("health.protect_on_route_failure", "player.nametag.path", "monsters.names",
+                   "loot.enabled", "route.circuit.enabled", "route.circuit.return_on_block",
+                   "route.circuit.waypoints", "route.circuit.editor_plan")
+SETTINGS_CHANGED_MESSAGE = ("The settings file was changed outside this window (for example by "
+                            "maplebot-cli import-settings) after it was loaded. The form now shows the "
+                            "saved settings; nothing was overwritten. Review them, then choose Save again.")
+
+
+def _get(data, path: str):
+    node = data
+    for piece in path.split("."):
+        if not isinstance(node, dict) or piece not in node:
+            return None
+        node = node[piece]
+    return node
+
+
+def _form_snapshot(data: dict, form_keys) -> dict:
+    """The user-file values of every key the form writes, to detect changes made elsewhere."""
+    return {path: copy.deepcopy(_get(data, path)) for path in sorted(set(form_keys) | set(FORM_EXTRA_KEYS))}
 
 
 def _startup_return_display(status):
@@ -114,9 +179,20 @@ def _health_protection_display(status):
     startup = _startup_return_display(status)
     if startup and startup[1] not in detail:
         detail = startup[1] + " " + detail
+    diagnosis = str(status.get("health_protection_diagnosis_detail") or "").strip()
+    if state == "needs_attention" and diagnosis and diagnosis not in detail:
+        detail += " " + diagnosis
     taps = status.get("health_protection_taps")
     if isinstance(taps, int) and not isinstance(taps, bool) and taps > 0:
         detail += f" HP potion key presses: {taps}; a key press does not confirm HP restoration."
+        responses = status.get("health_protection_responses")
+        # One rise can answer several presses, so this counts rises, not presses.
+        # A zero while healing only means the first response window is still open.
+        if (isinstance(responses, int) and not isinstance(responses, bool) and 0 <= responses <= taps
+                and (responses > 0 or state == "needs_attention")):
+            rises = f"{responses} HP rise" + (" was" if responses == 1 else "s were")
+            presses = f"{taps} sent press" + ("" if taps == 1 else "es")
+            detail += f" {rises} observed after {presses}."
     return label, detail
 
 
@@ -305,7 +381,12 @@ class SettingsWindow(tk.Tk):
         ttk.Label(circuit, text="Returns use saved map connections and stop if no path is known.\nOpening the editor pauses movement; save a profile before resuming.", style="Muted.TLabel", wraplength=500).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
         detection = tabs["Detection"]
         ttk.Label(detection, text="Calibrated for your current 1920 × 1080 game window.", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
-        self._field(detection, 1, "Character image", "player.nametag.path", width=28)
+        self.values["player.nametag.path"] = tk.StringVar()
+        ttk.Label(detection, text="Character image").grid(row=1, column=0, sticky="w", padx=(0, 22), pady=5)
+        image_row = ttk.Frame(detection)
+        image_row.grid(row=1, column=1, sticky="w", pady=5)
+        ttk.Entry(image_row, textvariable=self.values["player.nametag.path"], width=28).pack(side="left")
+        ttk.Button(image_row, text="Browse...", command=self._browse_character_image).pack(side="left", padx=(8, 0))
         self._field(detection, 2, "Character match tolerance", "player.nametag.diff_thres")
         self._field(detection, 3, "Monster match tolerance", "monsters.diff_thres")
         self._field(detection, 4, "Stop after missing character (frames)", "safety.max_missing_frames")
@@ -315,6 +396,11 @@ class SettingsWindow(tk.Tk):
         ttk.Button(footer, text="Reload settings", command=self._load).pack(side="left")
         self.save_button = ttk.Button(footer, text="Save & apply", style="Accent.TButton", command=self._save)
         self.save_button.pack(side="right")
+        setup = ttk.Frame(settings)
+        setup.pack(fill="x", pady=(8, 0))
+        if (ROOT / "examples" / "construction-site").is_dir():
+            ttk.Button(setup, text="Load example settings...", command=self._load_example).pack(side="left", padx=(0, 8))
+        ttk.Button(setup, text="Import settings...", command=self._import_settings).pack(side="left")
         ttk.Label(settings, textvariable=self.message, style="Muted.TLabel", wraplength=530).pack(anchor="w", pady=(12, 0))
         relay_heading = ttk.Frame(relay)
         relay_heading.pack(fill="x", pady=(2, 10))
@@ -386,6 +472,7 @@ class SettingsWindow(tk.Tk):
             self.map_title.set("Character settings · " + str(cfg.get("map_profile", {}).get("name") or "No map profile selected"))
             self._loaded_map_identity = (cfg.get("map_profile", {}).get("active"), tuple(cfg.get("minimap", {}).get("fixed_rect") or []))
             self._loaded_config_mtime = USER_CONFIG.stat().st_mtime_ns if USER_CONFIG.exists() else None
+            self._loaded_form_values = _form_snapshot(_read_user(), self.values)
             for path, var in self.values.items():
                 value = cfg
                 for part in path.split("."):
@@ -523,16 +610,29 @@ class SettingsWindow(tk.Tk):
         _set(data, "route.circuit.waypoints", points)
         return data
 
+    def _settings_changed_on_disk(self) -> bool:
+        """True when a key the form writes changed in user.yaml since the form was loaded or saved."""
+        loaded = getattr(self, "_loaded_form_values", None)
+        if loaded is None:
+            return False
+        return _form_snapshot(_read_user(), self.values) != loaded
+
     def _save(self) -> bool:
         if self._editing_map():
             return False
         try:
+            if SettingsWindow._settings_changed_on_disk(self):
+                self._load()
+                self.message.set(SETTINGS_CHANGED_MESSAGE)
+                messagebox.showwarning("Settings changed on disk", SETTINGS_CHANGED_MESSAGE, parent=self)
+                return False
             data = self._validated()
             from maplebot.editor_bridge import EditorBridge
             EditorBridge(ROOT).sync_active_settings(data)
             pending = USER_CONFIG.with_suffix(".yaml.tmp")
             pending.write_text("# Local Maplebot settings\n" + yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
             pending.replace(USER_CONFIG)
+            self._loaded_form_values = _form_snapshot(data, self.values)
             self._saved_pickup_key = data.get("keys", {}).get("pickup", "")
             self._saved_health_enabled = bool(data.get("health", {}).get("enable", True))
             self._saved_hp_key = str(data.get("keys", {}).get("hp_potion") or "")
@@ -608,16 +708,19 @@ class SettingsWindow(tk.Tk):
             if _can_resume_manual_hold(self.status):
                 SettingsWindow._resume_farming(self)
             return
+        pending = getattr(self, "launch_process", None)
+        if pending is not None and pending.poll() is None:
+            return  # the Windows prompt from the previous Start is still open
         if time.time() < self.launch_deadline:
             return
         if not self._save():
             return
         try:
-            self.launch_process = subprocess.Popen(
-                ["powershell.exe", "-NoProfile", "-File", str(ROOT / "scripts/start_active.ps1")],
-                cwd=str(ROOT), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            try:
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            except (AttributeError, OSError, tk.TclError):
+                hwnd = 0
+            self.launch_process = launcher.start_controller(ROOT, wait_for_start=False, hwnd=hwnd)
             self.launch_deadline = time.time() + 45
             self.message.set("Approve the Windows administrator prompt, then bring MapleStory to the front.")
             self.start_button.configure(state="disabled")
@@ -689,6 +792,61 @@ class SettingsWindow(tk.Tk):
         except (OSError, ValueError) as exc:
             messagebox.showerror("Could not return to point 1", str(exc), parent=self)
 
+    def _browse_character_image(self):
+        from tkinter import filedialog
+        assets = ROOT / "assets"
+        chosen = filedialog.askopenfilename(parent=self, title="Choose your character's nametag image",
+                                            initialdir=str(assets if assets.is_dir() else ROOT),
+                                            filetypes=[("PNG images", "*.png")])
+        if not chosen:
+            return
+        try:
+            self.values["player.nametag.path"].set(_import_character_image(ROOT, chosen))
+            self.message.set("Character image selected. Choose Save & apply to use it.")
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Could not use this image", str(exc), parent=self)
+
+    def _load_example(self):
+        if self._editing_map():
+            return
+        if not messagebox.askyesno("Load example settings",
+                "Load the Construction Site example settings and map profile?\n\n"
+                "This only works while your settings are still empty and no controller is running. "
+                "The example was calibrated for one character; recalibrate your own nametag image.", parent=self):
+            return
+        try:
+            first_run.restore_example(ROOT, alive=lambda: launcher.controller_alive(ROOT))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Could not load the example", str(exc), parent=self)
+            return
+        self._load()
+        self.message.set("Example settings loaded. Review them, then choose Save & apply.")
+
+    def _import_settings(self):
+        if self._editing_map():
+            return
+        from tkinter import filedialog
+        folder = filedialog.askdirectory(parent=self, mustexist=True,
+                                         title="Choose the other Maplebot folder to import settings from")
+        if not folder:
+            return
+        if not messagebox.askyesno("Import settings",
+                f"Copy config\\user.yaml and config\\map_profiles from\n{folder}\ninto this Maplebot folder?\n\n"
+                "This only works while this folder's settings are still empty and no Maplebot controller "
+                "is running (stop the other one first). Nothing is deleted.", parent=self):
+            return
+        try:
+            result = first_run.import_settings(
+                ROOT, folder, alive=lambda: launcher.any_controller_alive([ROOT, Path(folder)]))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Could not import settings", str(exc), parent=self)
+            return
+        self._load()
+        text = f"Imported {len(result['copied'])} file(s). Review the settings, then choose Save & apply."
+        if result["warnings"]:
+            messagebox.showwarning("Imported with warnings", "\n".join(result["warnings"]), parent=self)
+        self.message.set(text)
+
     def _ensure_relay(self):
         now = time.time()
         if now - self.relay_start_check < 3:
@@ -709,7 +867,7 @@ class SettingsWindow(tk.Tk):
                 self.relay_output.close()
             self.relay_output = open(LOG / "relay-helper.log", "a", encoding="utf-8")
             self.relay_process = subprocess.Popen(
-                [sys.executable, str(ROOT / "scripts/relay_client.py")], cwd=str(ROOT),
+                launcher.relay_command(ROOT), cwd=str(ROOT),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 stdout=self.relay_output, stderr=self.relay_output,
             )
@@ -966,10 +1124,13 @@ class SettingsWindow(tk.Tk):
             self.activity.set(activity)
         else:
             pending = time.time() < self.launch_deadline
-            if self.launch_process is not None and self.launch_process.poll() not in (None, 0):
+            launch_code = self.launch_process.poll() if self.launch_process is not None else None
+            if launch_code not in (None, 0):
                 self.launch_deadline = 0
                 pending = False
-                self.message.set("The launch did not complete. Try Start active and approve the Windows prompt.")
+                self.message.set(launcher.launch_failure_message(
+                    launch_code, getattr(self.launch_process, "reason", None)))
+                self.launch_process = None  # report a finished launch once, not on every poll
             self.state_text.set("Starting…" if pending else "Stopped")
             self.vitals.set("HP  —     MP  —     Speed  —")
             self.activity.set("Waiting for administrator approval or the game window" if pending else "Choose Start active when your character is ready")

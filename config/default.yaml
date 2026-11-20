@@ -88,6 +88,224 @@ attack:
   min_overlap_px: 1500
   tie_margin_px: 50
   deadzone_px: 30              # stop walking toward a target closer than this
+  surface:                     # same-surface test for circuit maps with drawn platforms
+    enabled: false             # true: a target's sprite bottom must rest on the player's own platform surface
+    feet_offset_px: 12         # player fix to feet, screen px (same-floor sprite bottoms sit here)
+    above_px: 32               # accepted height above the expected surface (hops, uphill treads)
+    below_px: 22               # accepted depth below it; deeper means another stair/floor underneath
+  # The expected surface follows slopes: (platform height at the monster - height at the player)
+  # * route.circuit.pixels_per_minimap_y (defaults to pixels_per_minimap_x).
+  # pre_transition_s: 0        # 0 = off. Seconds (0-10) per jump/ramp/drop waypoint the bot may spend
+  #                            # attacking a fresh in-range monster on its own surface BEFORE the takeoff
+  #                            # key: while lining up, settling, or re-aligning after a failed attempt.
+  #                            # It only turns and attacks there (no walking toward the target); a short
+  #                            # detection gap (up to 0.4 s) waits without keys and is charged too. Once the
+  #                            # takeoff key is out, on a rope, or returning to point 1, the transition
+  #                            # keeps absolute priority, as it does when the allowance is spent.
+  #                            # Not live-verified.
+  # pre_transition_gap_veto_x: false  # absent/null/false = off. Otherwise a number above 0 and at most 20
+  #                            # (minimap px). At a LEVEL gap jump take-off (the take-off zone rule's level
+  #                            # gap: flat floors, gap 0-1.5 px, saved take-off 1-4 px from it) that is still
+  #                            # lining up, with the character strictly on the take-off floor (and on no
+  #                            # other drawn platform, so not at x=89 on the Construction Site right
+  #                            # floors, where a stair top overlaps) and closer than
+  #                            # this to the gap edge, a same-platform detection on the side AWAY from the
+  #                            # flight ends the pre-takeoff fight for that frame: the route steps exactly as
+  #                            # with pre_transition_s 0 (no attack, no wait). A detection only on the flight
+  #                            # side keeps the fight. Never on stairs, ramps, drops, ropes, stair jumps or
+  #                            # rejoin/return routes. Counted as gap_veto_frames. Offline-tested only, NOT
+  #                            # live-verified; A/B it separately from route.circuit.gap_reentry.
+  # gap_landing_band_x: false     # absent/null/false = off. Otherwise 2-12 minimap px. After a LEVEL gap
+  #                               # jump (the take-off zone rule's level gap), on the walks that follow it on
+  #                               # its landing floor, the last X px before that floor's gap-side end form
+  #                               # an edge band: combat walking and pursuit never step toward the edge within
+  #                               # 1 px of it (face + attack in place instead), kill sites in the band are
+  #                               # not looted, and while the character stands in the band and the route is
+  #                               # not walking toward the edge the route alone is stepped (no fight, no loot
+  #                               # start; begun outside visits are kept for later) for at most
+  #                               # gap_landing_band_priority_s (2.5; 0 = no priority, filters only;
+  #                               # 0.5-4) per waypoint selection and gap_landing_band_lap_s (8; up to 20) per
+  #                               # lap. No new attack or target; HP protection unchanged. Never on stairs,
+  #                               # ramps, drops, ropes, take-off floors or return/rejoin routes. Costs
+  #                               # collection of drops in the band. Counted under 'edge_band' in the
+  #                               # status. Offline-tested only, NOT live-verified; A/B it on its own; it can
+  #                               # run with route.circuit.gap_reentry on. Needs the saved editor plan.
+
+# Optional loot keys (the `loot:` section is absent by default; see maplebot/nav/loot.py):
+#   walk_speed_x: 0    minimap px/s while a key is held, as an upper bound. > 0 sizes each leased
+#                      approach pulse from the remaining distance (capped 0.5 s, 1 px short of the
+#                      outward edge) instead of fixed 0.04 s taps.
+#   max_pending: 0     1-4 remembers kill sites displaced by a newer target for one later bounded
+#                      visit on the same platform; pending_s (8) is how long a site stays valid and
+#                      switch_x (2.5 minimap px) is the jump that marks a changed target.
+#                      max_pending needs walk_speed_x, so every walk-back is leased.
+# Optional route.circuit approach keys (maplebot/nav/circuit.py, walk waypoints only; absent = off):
+#   approach_fine_radius_x   inner radius that keeps the fine approach_pulse_s taps; setting it turns
+#                            distance-sized leased pulses on between it and approach_radius_x
+#   approach_walk_speed_x    held walking speed in minimap px/s. Must be an UPPER bound on the real
+#                            speed (Construction Site measured 9.2-9.8), or pulses overshoot
+#   approach_stop_margin_x   a pulse aims this far short of the waypoint (default 1.0)
+#   approach_edge_margin_x   and this far short of the platform edge; must be >= stop margin + 0.75
+#   approach_far_pulse_max_s cap per pulse (default 0.4, at most 0.6)
+#   approach_far_release_s   release after such a pulse (default approach_release_s)
+#   approach_resume_credit   true: release already served before a combat/loot interruption counts
+#   Jump, ramp, drop and climb alignment and every return-to-start route keep the fine taps
+#   unless the transition-timing keys below opt in.
+# Optional route.circuit transition-timing keys (maplebot/nav/circuit.py; all OFF when absent).
+# Offline-tested only (tests/test_transition_timing.py), NOT live-verified. They change no
+# takeoff tolerance, support test, landing proof, settle time, lease or retry count. A saved map
+# profile needs them in its circuit_settings too. Enable one key per supervised run, A first.
+#   commit_budget: false          true: once a transition is physically under way (ramp started,
+#                                 Jump sent, Down+Jump sent or a fall seen, on the rope by minimap
+#                                 height) the waypoint clock timeout_s no longer cuts it. It ends by
+#                                 its own budget from the takeoff; a fall or a rope also after
+#                                 transition_stall_s without one more whole pixel of progress
+#                                 ("drop stalled"; a rope takes the existing retry / "waypoint
+#                                 timeout" path). A ramp has no such rule: a verified lap stood 5 s
+#                                 on a stair with the key held and then walked up. Time before the
+#                                 takeoff (waiting, aligning, settling, re-aligning) is still bounded
+#                                 by timeout_s. Read only when true:
+#     ramp_travel_timeout_s         per ramp takeoff (2-30, default timeout_s clamped into that
+#                                   range), plus the landing dwell while it is proven
+#     drop_fall_timeout_s: 6        per launch or observed fall (2-30), plus the landing dwell
+#     climb_travel_timeout_s        rope time per waypoint selection (2-60, default timeout_s
+#                                   clamped into that range); leaving and re-entering the rope
+#                                   does not renew it
+#     landing_confirm_timeout_s: 3  a jump that stands at its landing but never holds still fails
+#                                   this long after jump_flight_timeout_s (1-10), plus its dwell
+#     transition_stall_s: 2         no-progress limit on a fall or a rope (1-5); not on a ramp
+#   takeoff_far_approach: false   true: jump, ramp, drop and rope takeoff alignment may use the
+#                                 distance-sized leased pulses above, only while a fresh frame is
+#                                 strictly on the SOURCE platform. A pulse is sized from the floor
+#                                 beyond the takeoff point, so that even one started on the takeoff
+#                                 point would stop approach_edge_margin_x before that platform's
+#                                 end. A takeoff closer to the end ahead than that margin plus one
+#                                 fine tap (the gap jumps, 2 px from the gap) keeps fine taps in
+#                                 that direction. Inside approach_fine_radius_x the fine taps
+#                                 finish; the takeoff tolerance and align_settle_s on aligned
+#                                 frames are unchanged. Needs the approach_fine_radius_x keys.
+#   recovery_far_approach: false  true: return-to-start and platform-rejoin routes may use far pulses
+#                                 for their walk legs (and for takeoffs when takeoff_far_approach is
+#                                 also true). They never use approach_resume_credit. Needs the
+#                                 approach_fine_radius_x keys. A return still never fights.
+# Optional route.circuit take-off zones (maplebot/nav/zones.py, maplebot/nav/circuit.py; OFF when
+# absent). Offline-tested only (tests/test_takeoff_zones.py), NOT live-verified. Landing proof,
+# support tests, settle time, lease lengths and retry counts are unchanged. Two things follow the
+# take-off point instead of the saved X: the landing X window of a drop launched away from its
+# saved spot, and the rear end of a ramp's corridor and knock-back window (a ramp started in its
+# zone also holds its direction key, unleased as every ramp, from up to takeoff_zone_max_x further
+# back). They need the saved editor plan, and a saved map profile needs the keys in its
+# circuit_settings too.
+#   takeoff_zones: false          true: the FIRST attempt of a jump, ramp or drop may take off from
+#                                 a short stretch of its source platform instead of from one saved
+#                                 pixel, and the walk waypoint in front of it ends anywhere on that
+#                                 stretch. The stretch comes from the saved map alone. Drop: where
+#                                 source and destination are level and no other drawn platform or
+#                                 saved rope lies in or beside the fall. Ramp: back along a sloped
+#                                 stair, not where another platform is at the stair's height. Jump:
+#                                 the last pixels before a level gap of at most 1.5 px, never
+#                                 further from the gap than the saved spot; every other jump and
+#                                 every rope keeps its saved spot. The settle before the take-off is
+#                                 unchanged and additionally needs X to stay on one pixel. After a
+#                                 launch or a failed attempt, on a lower ledge, in editor connection
+#                                 tests and for jumps on return/rejoin routes the saved spot and its
+#                                 own tolerance apply as before. A drop that took off away from its
+#                                 saved spot is accepted, after its unchanged landing proof, within
+#                                 the zone plus 2 px on the destination platform once its whole
+#                                 landing dwell was spent on the destination; a ramp started in
+#                                 its zone measures its corridor and knock-back from where it
+#                                 started. Read only when true:
+#     takeoff_zone_kinds: [drop, jump, ramp]
+#                                   which transition kinds get a zone (non-empty, no repeats).
+#                                   Return/rejoin routes use the drops and ramps of this list,
+#                                   never a jump. [drop, jump] keeps every ramp on its saved spot.
+#     takeoff_zone_max_x: 8         furthest a zone reaches from the saved take-off X (1-20)
+#     takeoff_zone_margin_x: 1.5    distance kept from the source platform's ends (1-4); a fall
+#                                   column stays this plus 1 px, and at least 2.5 px, clear of
+#                                   every other drawn platform and of the destination's ends
+# route.circuit regain-support stage (maplebot/nav/regain.py; code defaults apply when absent).
+# Runs before a return to point 1 is planned (Resume, Return to point 1, blocked-route recovery)
+# when the character is on no drawn platform. Offline-tested only, NOT live-verified.
+#   return_regain_support: true   false keeps the old behaviour: wait 3 s, then guarded HP Hold
+#   regain_timeout_s: 20          active seconds for the whole stage (5-30); it also counts
+#                                 inside return_timeout_s
+#   regain_max_walk_x: 16         furthest it may walk from where it stood, minimap px (4-40)
+#   It only sends short leased Left/Right pulses (<= 0.25 s) inside the drawn floor underneath,
+#   or Down on a saved rope; never Up or Jump. Any failure ends in guarded HP Hold.
+#   Last resort, only after Left and Right pulses both moved nothing and one drawn floor lies
+#   underneath (e.g. a rope the map does not draw): Down alone, leased <= 0.3 s per fresh frame,
+#   ended after 1.5 s without descent. Down descends a rope and releases at its bottom, only
+#   crouches on a solid surface, and does not enter portals (Up does). NOT live-verified.
+#   A direction with under 2 px of room is pulsed for its whole 6 s leg before it counts as
+#   "moved nothing"; a changed position gets its own Left/Right pulses before any Down.
+# route.circuit wrong-platform handling (maplebot/nav/circuit.py, maplebot/nav/recovery.py).
+# Both keys are OFF when absent, need the saved editor plan, and are ignored by editor
+# connection tests and by return/rejoin routes. Offline-tested only, NOT live-verified.
+# A saved map profile recompiles route.circuit from its circuit_settings, so for live use
+# the keys belong in the profile's circuit_settings as well.
+#   arrive_on_destination: false      true: a jump waypoint whose character already stands
+#                                     on the jump's saved destination platform (knocked across
+#                                     a narrow gap) is accepted without pressing Jump, after
+#                                     3 fresh frames / 0.5 s of strict support there, a
+#                                     precision walk to the landing X, then the normal landing
+#                                     proof with the 0.65 s no-descent dwell. Jump only.
+#                                     The same knock during the walk waypoint(s) leading to
+#                                     that jump's takeoff, on the takeoff platform, hands over
+#                                     to the jump waypoint after the same 3-frame proof; those
+#                                     remaining takeoff walks are then not visited.
+#   platform_rejoin: false            true: a walk, jump or ramp waypoint whose character is
+#                                     stably (3 fresh frames / 0.5 s / 0.5 px) on another drawn
+#                                     platform walks the shortest saved connections back to the
+#                                     waypoint's platform (walk) or takeoff (jump, ramp). The
+#                                     waypoint index never changes; no return to point 1 is spent.
+#   max_platform_rejoins_per_lap: 3   started rejoins per lap (1-5); only a completed lap resets it
+#   platform_rejoin_timeout_s: 20     stepped seconds per rejoin (5-60). A flight, ramp or rope
+#                                     already under way is never cut; it ends by its own proof
+#                                     or block first.
+#   platform_rejoin_max_transitions: 1  connections a rejoin path may use (1-4). 20 s fits one
+#                                     connection; raise the timeout together with this value.
+#   No combat or loot runs during a rejoin. A failed, timed-out or unplannable rejoin is not a
+#   block: the waypoint keeps its own timeout, then the usual return/Hold follows. Only when
+#   the rejoin ends with the character already on the waypoint's platform does the waypoint
+#   get a fresh timeout window (its retries stay spent). On the Construction Site, floor-3 ->
+#   floor-3-right and floor-4 -> floor-4-right have no saved path within 2 connections (there
+#   is no floor-3-return / floor-4-return jump); arrive_on_destination covers that knock. Positions
+#   that are unsupported or on two overlapping drawn platforms (x=89 on the Construction Site
+#   right floors) keep the old wait. The older fall-to-a-lower-floor rejoin keeps precedence.
+# route.circuit gap re-entry (maplebot/nav/circuit.py, maplebot/brain/fsm.py; OFF when absent).
+# Needs the saved editor plan and drawn platforms; ignored by editor connection tests and by
+# return/rejoin routes. A saved map profile needs the keys in its circuit_settings too.
+# Offline-tested only (tests/test_gap_reentry.py), NOT live-verified.
+#   gap_reentry: false                true: a walk waypoint on the landing floor of a LEVEL gap
+#                                     jump (flat floors, gap 0-1.5 px, the take-off zone rule's
+#                                     test), knocked back onto that jump's take-off floor and
+#                                     stably there (3 fresh frames / 0.5 s / 0.5 px, strict
+#                                     support; x=89 on the Construction Site right floors never
+#                                     qualifies), re-selects the walk before the jump (10 -> 8,
+#                                     18 -> 16, 26 -> 24 on the Construction Site) and runs the
+#                                     saved jump again with its own unchanged landing proof. It is
+#                                     tried before platform_rejoin and spends no rejoin; the
+#                                     legacy lower-floor fall and arrive_on_destination keep
+#                                     precedence. Never for stair jumps, drops, ramps, ropes, in
+#                                     flight or landing, while recovering, rejoining or returning.
+#                                     While one is pending the brain steps the route before combat
+#                                     and loot for a short window (below): no attack, no own
+#                                     movement, the route clock runs; like a transition frame, a
+#                                     window frame drops remembered loot sites. Status: reentry_count,
+#                                     reentry_last, reentry_priority_frames.
+#     max_gap_reentries_per_lap: 2    re-entries per lap (1-5); only a completed lap resets it,
+#                                     never a re-selection, retry, rejoin or return. Read only when
+#                                     gap_reentry is on. Each re-entry re-selects walk g-1, jump g
+#                                     and walk g+1 with fresh timeout_s and max_retries each, and
+#                                     the pre-takeoff fight allowance (pre_transition_s) is fresh
+#                                     too. Bound on the Construction Site settings: about
+#                                     (15+0.6+15) s each for walk g-1, jump g and the fresh window
+#                                     of the landing walk g+1 + flight bounds + up to
+#                                     pre_transition_s of frozen pre-fight, roughly 100 s per
+#                                     re-entry and 200 s per lap at the default of 2.
+#     gap_reentry_priority_s: 1.5     brain priority window per waypoint selection while a
+#                                     re-entry is pending (0.5-3.0 s, charged per frame). Once it
+#                                     is spent, frames go to the ordinary combat/loot code.
 
 route:
   dir: minimaps
@@ -147,3 +365,31 @@ debug:
   show: true
   scale: 0.6
   route_zoom: 3
+
+# On-screen gain evidence (maplebot/evidence.py, maplebot/vision/gains.py). Telemetry only: it never
+# sends input and never changes a decision. The counters are observations of the HUD on fresh frames
+# of the recognised map - lower bounds on gain events, not exact kill, meso or item counts.
+# LAYOUT-SPECIFIC: every rect and both templates were measured on the 1366x768 prepared frame of the
+# Construction Site run (15 Nov 2026). A different resolution, UI scale or HUD layout needs new rects
+# and templates; a rect that does not fit the frame reports its counters as null, not 0.
+evidence:
+  enabled: false               # true: track and publish an 'evidence' dict in log/active-status.json
+  exp_text_rect: [738, 737, 107, 14]   # [x, y, w, h] of the digits "5,192 [95.09%]" above the EXP bar
+  exp_text_pixel_delta: 24     # a pixel "changed" when its largest channel difference exceeds this
+  exp_text_min_pixels: 10      # changed pixels for "the EXP text changed" (measured: 0 unchanged, 27-168 changed)
+  gain_line_rect: [1150, 604, 214, 16] # newest (bottom) gain notification line, right-aligned near x=1358
+  gain_line_pitch: 14          # older lines sit this many rows higher
+  gain_line_slots: 3           # slots watched (2-4); 3 can prove two lines arriving between two captures
+  gain_line_fresh_pixels: 40   # outlined-white pixels for a fresh line (measured 40-213)
+  gain_line_empty_pixels: 15   # below this the slot counts as empty (measured empty <= 8)
+  gain_line_shift_score: 0.45  # similarity for "the previous newest line is now one slot up" (measured 0.50-0.85);
+                               # also: a line this similar to what its slot showed one capture earlier is not new
+  gain_line_shift_margin: 0.15 # ...and it must beat the same comparison one capture earlier by this much
+  exp_line_score: 0.5          # prefix template score for an EXP line (measured 0.49-1.00 true, <= 0.41 otherwise);
+                               # the weakest measured true lines (0.49) fall to 'other', the conservative outcome
+  meso_line_score: 0.45        # prefix template score for a meso line (measured 0.52-1.00 true, <= 0.35 otherwise)
+  templates:                   # "You received EXP (" / "You have gained mesos (" crops, relative to the repo root
+    exp: assets/gain-line-exp-prefix.png
+    meso: assets/gain-line-meso-prefix.png
+  max_gap_s: 2.0               # a longer gap between fresh frames drops the comparison baselines
+  max_dt_s: 1.0                # per-frame cap on seconds added to an activity bucket

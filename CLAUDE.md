@@ -6,7 +6,7 @@ Read [docs/DEVELOPMENT_HANDOFF.md](docs/DEVELOPMENT_HANDOFF.md) before changing 
 
 - The working Windows checkout is `%USERPROFILE%\source\repos\maplebot`. The WSL checkout at `~/Dev/maplebot` is a separate checkout; do not assume its files or running processes are synchronized.
 - The Windows interpreter is `%USERPROFILE%\.venvs\maplebot\Scripts\python.exe`. Run commands from the repository root. Live capture/input must run on Windows.
-- Reference implementations are available locally at `~/Dev/maplestory-auto-ds` and `~/Dev/MapleStoryAutoLevelUp`. They are research references, not runtime dependencies.
+- Reference implementations are available locally in WSL at `~/Dev/maplestory-auto-ds` and `~/Dev/MapleStoryAutoLevelUp`. They are research references, not runtime dependencies.
 - Install with `scripts/setup_windows.ps1`, then use `scripts/open_settings.ps1`. `scripts/start_active.ps1 -WaitForStart` starts the controller paused. Windows consent, if shown, must be handled by the user.
 - Use `scripts/run_active.py` for live operation. The legacy `python -m maplebot run` command bypasses the settings app's startup-return coordinator.
 - Keep local `config/user.yaml`, `config/map_profiles/`, logs, and recordings out of commits. The versioned [Construction Site example](examples/construction-site/README.md) preserves this handoff's calibration without overwriting live settings.
@@ -43,6 +43,7 @@ The controller was left farming at the end of the last supervised run. This is h
 | Startup and blocked-route recovery | `maplebot/recovery_runtime.py`, `maplebot/nav/recovery.py` |
 | HP protection | `maplebot/health_protection.py`, `maplebot/health.py` |
 | Combat and collection | `maplebot/brain/fsm.py`, `maplebot/vision/monsters.py`, `maplebot/vision/player.py`, `maplebot/nav/loot.py` |
+| On-screen gain evidence | `maplebot/evidence.py`, `maplebot/vision/gains.py` |
 
 ## Offline verification
 

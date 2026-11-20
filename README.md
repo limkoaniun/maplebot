@@ -76,7 +76,7 @@ HP/MP/EXP readings. **Game view** is a separate live window capture and also wor
 while the controller is stopped. Closing settings closes its preview; use Stop or
 F12 to stop the controller. The pickup counter counts key presses, not collected items.
 
-The local player profile uses Z for Double Stab, Alt for normal attack, C to jump,
+The local example profile uses Z for Double Stab, Alt for normal attack, C to jump,
 Q/A for HP/MP potions, and X for pickup. Its monster matches require both shape and
 color agreement. Character tracking uses the nametag with a short, local head-image
 fallback; missing capture or prolonged missing character/minimap detection stops input.
@@ -108,6 +108,32 @@ This also works from the mapped left entry pipes in Construction Site. If the
 current position has no saved connection to the route, farming stays held and
 shows the missing-path reason. A successful startup return does not consume the
 lap's blocked-route recovery allowance.
+
+If the character is not standing on a drawn platform when a return starts (for
+example on undrawn pipes, hanging on a saved rope, just past a drawn end, or in
+the air), the controller first tries to regain support: it waits until the
+position is still, then holds Down on a saved rope, or sends short Left/Right
+pulses toward the drawn floor directly underneath or the drawn platform beside
+it. It never presses Up or Jump, walks at most `regain_max_walk_x` (16) minimap
+pixels, and gives up after `regain_timeout_s` (20 s). The normal return starts
+only once the strict platform check accepts the position. If the Left and
+Right pulses both move nothing (the character is evidently not standing on a
+walkable surface, for example hanging on a rope or ladder that the map does not
+draw) and exactly one drawn floor lies underneath, it then holds Down alone in
+short leases: Down climbs down a rope and lets go at its lower end, only
+crouches on solid ground, and does not enter portals. That attempt ends after
+1.5 s without descent. Next to the end of the drawn floor, where one direction
+has under 2 pixels of room, that direction is pulsed for its full 6 s before it
+counts as not moving, so the descent starts later there. If the character has
+moved since the pulses, Left and Right are tried again at the new spot before
+Down. This does not work from everywhere: a wide undrawn
+surface, a spot with no drawn floor below or beside, or an undrawn spot where
+neither Left, Right nor Down moves the character still ends in Hold farming
+with a "Could not reach a drawn platform" reason; move the character or draw
+that surface. Set `route.circuit.return_regain_support: false` to turn the
+stage off. The saved-rope and the undrawn-rope descent were each seen once in a
+supervised run; the walk-off is covered by offline tests only. None of this is
+a general verification in the live game.
 
 **Hold farming** releases movement and combat while keeping guarded HP protection
 on. **Resume farming** starts the return described above. **Pause all** and **Stop**
@@ -237,6 +263,68 @@ any paint program if needed; the bot reads exact colours.
   direction, only with confirmed support and a stable landing on the destination.
 - `attack.range_x/range_y` and `attack.deadzone_px` control when the bot attacks and when
   it stops walking toward a target. `attack.mode: aoe` uses a centred box instead.
+- `attack.pre_transition_s` (default 0 = off, at most 10) lets the bot turn and attack a
+  monster that is in range on its own platform while it is still lining up for a jump,
+  ramp or drop, for that many seconds per waypoint. It never walks toward the target
+  there, and nothing interrupts a transition once its takeoff key was sent. When the
+  monster is not detected for a moment the bot waits without keys for up to 0.4 s
+  before lining up again; that wait counts toward the same seconds. Not yet verified
+  in the game.
+- `attack.surface.enabled` requires a target's sprite to rest on the character's own
+  platform surface, following stairs, so a monster on the stair or floor underneath is
+  ignored. `loot.walk_speed_x` sizes pickup approach pulses from the distance and
+  `loot.max_pending` remembers kill sites displaced by another fight. The
+  `route.circuit.approach_*` keys speed up walking to route stops. Speed keys must be at
+  least the real held walking speed in minimap pixels per second. `evidence.enabled`
+  publishes on-screen EXP and gain-line observations in `log/active-status.json`. All are
+  off by default and documented in `config/default.yaml`.
+- `route.circuit.commit_budget`, `route.circuit.takeoff_far_approach` and
+  `route.circuit.recovery_far_approach` (all off by default) change how long route
+  transitions may take. With `commit_budget`, a ramp, jump, drop or rope climb that has
+  already started is no longer stopped by the route point's general time limit; it gets
+  its own limit from the moment it starts. A drop or rope climb is also stopped after
+  two seconds without progress. A ramp is not, and by default it gets the route point's
+  whole time limit again from its start. The time allowed for lining up before the
+  start is unchanged. `takeoff_far_approach` lets the bot walk to a jump, ramp, drop or
+  rope start with the same longer, distance-sized steps used for route stops. Each step
+  is short enough to stop the configured margin before the end of the platform even if
+  the character is knocked onto the start point while the key is down, so a start
+  within about two pixels of a platform end (the gap jumps) keeps the short taps when
+  it is approached toward that end. The last pixel and the short wait before the start
+  are as before. `recovery_far_approach` allows the same steps on the way back to
+  point 1 and when rejoining a platform. The last two need the `approach_*` keys. A
+  saved map profile needs the keys in its `circuit_settings` too. Tested offline only;
+  not yet verified in the game.
+- `route.circuit.takeoff_zones` (off by default) lets the first try of a jump, ramp or
+  drop start from a short stretch of the platform instead of from one exact spot, so a
+  character that was pushed a few pixels aside does not have to creep back first. The
+  bot works that stretch out from the drawn map: for a drop, the part of the floor where
+  nothing else is drawn in or next to the way down; for a ramp, the part of the stair
+  behind the saved start; for a jump over a small level gap, the last pixel or two
+  before the gap. It still stands still for the usual moment before it starts, every
+  landing is checked exactly as before, and a second try goes back to the saved spot.
+  `takeoff_zone_kinds` (all of `[drop, jump, ramp]`) picks which kinds get a stretch;
+  `[drop, jump]` keeps every ramp on its saved spot, which is the suggested setting for a
+  first supervised run, because a ramp started further back is committed to the stair
+  earlier and in offline tests that helped or hurt depending on where hits landed.
+  `takeoff_zone_max_x` (8) limits how far the stretch may reach from the saved spot and
+  `takeoff_zone_margin_x` (1.5) how close it may come to the end of a platform. Jumps
+  onto stairs or other heights, ropes, and connection tests in the map editor always
+  use the saved spot. A saved map profile needs the keys in its `circuit_settings`
+  too. Tested offline only; not yet verified in the game.
+- `route.circuit.arrive_on_destination` and `route.circuit.platform_rejoin` (both off by
+  default) handle a character that was knocked onto a drawn platform the current route
+  point does not expect. The first accepts a jump point when the character already stands
+  on that jump's saved landing platform: it never presses Jump, waits for three fresh
+  frames over half a second, walks to the landing spot and then needs the usual stable
+  landing; if the knock happens while still walking to that jump's takeoff, the bot
+  goes straight to this check. The second walks the saved connections back to the point's own platform (or
+  to a jump or ramp takeoff) without changing the route point and without using the
+  lap's return to point 1; it is limited by `max_platform_rejoins_per_lap` (3),
+  `platform_rejoin_timeout_s` (20) and `platform_rejoin_max_transitions` (1). The bot
+  does not attack or collect during such a rejoin. If it fails, the point times out as
+  before. A saved map profile needs the keys in its `circuit_settings` too. Tested
+  offline only; not yet verified in the game.
 - `monsters.diff_thres` (lower = stricter), `monsters.scales` if your sprites are not 1:1,
   `monsters.min_color_spread` filters grey false positives (clouds), and
   `monsters.per_monster` overrides any of those per folder.

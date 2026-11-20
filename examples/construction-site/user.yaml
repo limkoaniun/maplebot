@@ -75,8 +75,50 @@ route:
     max_returns_per_lap: 1
     return_timeout_s: 60
     return_min_hp_percent: 40
+    # Regain-support stage before a return is planned from an undrawn spot (the entry
+    # pipes, a saved rope, just past a drawn end; Down alone on an undrawn rope after Left and
+    # Right both moved nothing). These are the code defaults. Offline-tested
+    # only, not live-verified; set return_regain_support to false for the old wait-then-hold.
+    return_regain_support: true
+    regain_timeout_s: 20
+    regain_max_walk_x: 16
     approach_pulse_s: 0.04
     approach_release_s: 0.45
+    # Suggested transition-timing values after the 2026-11-16 lap-3 failures (see
+    # config/default.yaml and docs/DEVELOPMENT_HANDOFF.md). Offline-tested only, NOT
+    # live-verified, so they stay commented out here. Enable one key per supervised run,
+    # commit_budget first; the last two need the far-approach keys. Leave
+    # ramp_travel_timeout_s unset (it defaults to timeout_s): one verified ramp of lap 1
+    # needed 8.4 s from its takeoff to its landing proof.
+    # commit_budget: true
+    # approach_fine_radius_x: 1.5
+    # approach_walk_speed_x: 11.0
+    # approach_stop_margin_x: 1.0
+    # approach_edge_margin_x: 1.75
+    # approach_far_pulse_max_s: 0.45
+    # approach_far_release_s: 0.3
+    # takeoff_far_approach: true
+    # recovery_far_approach: true
+    # Suggested take-off zones (see config/default.yaml and docs/DEVELOPMENT_HANDOFF.md).
+    # Offline-tested only, NOT live-verified, so they stay commented out here; enable them in
+    # a supervised run of their own. With these values the zones on this map are, in whole
+    # minimap pixels: gap jumps 90-91 (saved 91), top-drop 71-83 (saved 75), drop-4-3/3-2/2-1
+    # 52-64 (saved 60), drop-right-4-3/3-2 95-108 and drop-right-2-1 95-109 (saved 103); with
+    # ramp in takeoff_zone_kinds also the stair ramps 74-83 (saved 82). Stair-foot jumps, the
+    # barricade jump and drop, and the ropes keep their spot. The first supervised run leaves
+    # ramps out (see the handoff).
+    # takeoff_zones: true
+    # takeoff_zone_kinds: [drop, jump]
+    # takeoff_zone_max_x: 8
+    # takeoff_zone_margin_x: 1.5
+    # Suggested gap re-entry (see config/default.yaml and docs/DEVELOPMENT_HANDOFF.md).
+    # Offline-tested only, NOT live-verified, so it stays commented out here. On this map a
+    # landing walk knocked back onto floor-N-right re-selects 10 -> 8, 18 -> 16 or 26 -> 24.
+    # Put the same lines in the map profile's circuit_settings; run it on its own, without
+    # attack.pre_transition_gap_veto_x.
+    # gap_reentry: true
+    # max_gap_reentries_per_lap: 2
+    # gap_reentry_priority_s: 1.5
     enabled: true
     start_idx: 0
     loop: true
@@ -1058,6 +1100,14 @@ attack:
   tie_margin_px: 12
   cooldown_s: 0.65
   mp_fallback_percent: 5.0
+  # Take-off-side veto at the gap jumps (see config/default.yaml). NOT live-verified; a separate
+  # A/B after gap_reentry, never together with it.
+  # pre_transition_gap_veto_x: 6
+  # Landing edge band at the three floor gaps (see config/default.yaml). NOT live-verified; A/B it on its
+  # own; it can run with gap_reentry on.
+  # gap_landing_band_x: 8
+  # gap_landing_band_priority_s: 2.5
+  # gap_landing_band_lap_s: 8
 health:
   fixed_rects:
   - - 503

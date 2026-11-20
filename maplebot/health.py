@@ -1,6 +1,8 @@
 """Potion and buff decisions. Pure state machines fed with readings and the current time."""
 from __future__ import annotations
 
+import math
+
 
 class _PotionGate:
     """One resource: drink below `low`, re-arm above `low + rearm`, retry after `retry_s`.
@@ -38,6 +40,89 @@ class _PotionGate:
         return False
 
 
+class MpPressObservation:
+    """Observation only: MP-key presses actually sent without a following MP rise.
+
+    Fed a cumulative counter of MP-key presses the input backend really emitted
+    (for example the controller's ``keys_sent`` count for ``keys.mp_potion``).
+    It must never be fed ``_PotionGate`` requests: ``KeyboardController.request``
+    silently drops requests while HP-only, disabled, navigation-only or out of
+    focus, so a request is not a press.
+
+    A sent press is answered when a fresh MP reading reaches the reading before
+    that press + ``rise`` within ``response_s``; a press whose window ends
+    without that is unanswered. ``presses_unanswered`` counts unanswered sent
+    presses since an answered one. A rise with no sent press pending
+    (regeneration) neither answers nor resets anything, so a slowly
+    regenerating bar cannot hide an empty MP slot; regeneration inside a
+    response window can still look like an answer. The observer runs only
+    while input is ready, so a press pending across a gap of more than
+    ``response_s`` without a valid reading is counted in ``presses_unknown``:
+    regeneration during the gap must not answer it against a stale baseline.
+
+    This has no effect on control: the MP gate keeps its retry and backoff.
+    Below ``attack.mp_fallback_percent`` combat uses the normal attack, so an
+    empty MP item slot shows up here rather than as a stop.
+    """
+
+    def __init__(self, response_s: float = 3.0, rise: float = 2.0):
+        self.response_s = float(response_s)
+        self.rise = float(rise)
+        self.presses_sent = 0
+        self.presses_unanswered = 0
+        self.presses_answered = 0
+        # Sent presses that could not be judged: no valid reading for longer than
+        # ``response_s`` around them (pause, hold, latch), so neither answered nor not.
+        self.presses_unknown = 0
+        self._last_total: int | None = None
+        self._last_mp: float | None = None
+        self._last_mp_t: float | None = None
+        self._pending: list | None = None  # [baseline mp, last sent time, presses]
+
+    def observe(self, mp, now: float, sent_total) -> None:
+        if (type(sent_total) is not int or sent_total < 0 or not isinstance(now, (int, float))
+                or not math.isfinite(now)):
+            return
+        valid = (isinstance(mp, (int, float)) and not isinstance(mp, bool)
+                 and math.isfinite(mp) and 0 <= mp <= 100)
+        if self._last_total is None or sent_total < self._last_total:
+            self._last_total, self._pending = sent_total, None
+            if valid:
+                self._last_mp, self._last_mp_t = float(mp), now
+            return
+        delta = sent_total - self._last_total
+        self._last_total = sent_total
+        if delta:
+            self.presses_sent += delta
+            before = self._last_mp if self._last_mp is not None else (float(mp) if valid else None)
+            if self._pending is None:
+                self._pending = [before, now, delta]
+            else:
+                if before is not None:
+                    self._pending[0] = before if self._pending[0] is None else min(self._pending[0], before)
+                self._pending[1] = now
+                self._pending[2] += delta
+        if not valid:
+            return
+        if self._pending is not None:
+            baseline, sent_at, count = self._pending
+            if self._last_mp_t is not None and now - self._last_mp_t > self.response_s:
+                # Observation gap: the press baseline predates the gap and the window
+                # may have closed inside it, so regen during the gap cannot answer it.
+                self.presses_unknown += count
+                self._pending = None
+            elif baseline is None:
+                self._pending[0] = float(mp)
+            elif now - sent_at <= self.response_s and mp >= baseline + self.rise:
+                self.presses_answered += 1
+                self.presses_unanswered = 0
+                self._pending = None
+            elif now - sent_at >= self.response_s:
+                self.presses_unanswered += count
+                self._pending = None
+        self._last_mp, self._last_mp_t = float(mp), now
+
+
 class HealthPolicy:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -53,6 +138,29 @@ class HealthPolicy:
         self.mp: float | None = None
         self.last_hp_drop_t: float = 0.0
         self._reads = 0
+        # Observation only. The integrator may set ``mp_sent_counter`` to a
+        # callable returning the cumulative count of MP-key presses actually sent.
+        self.mp_sent_counter = None
+        self.mp_presses = MpPressObservation()
+
+    @property
+    def mp_presses_unanswered(self) -> int | None:
+        """Sent MP-key presses not followed by an MP rise; None without a sent counter.
+
+        An observation with no effect on control. Below attack.mp_fallback_percent
+        the normal attack is used, so an empty MP slot degrades combat only.
+        """
+        return None if self.mp_sent_counter is None else self.mp_presses.presses_unanswered
+
+    def _observe_mp_presses(self, mp, now) -> None:
+        counter = self.mp_sent_counter
+        if counter is None or mp is None:
+            return
+        try:
+            sent = counter()
+        except Exception:
+            return  # diagnostics must never interrupt potion decisions
+        self.mp_presses.observe(mp, now, sent)
 
     def update(self, hp: float | None, mp: float | None, now: float) -> list[str]:
         if hp is not None:
@@ -61,6 +169,7 @@ class HealthPolicy:
             self.hp = hp
         if mp is not None:
             self.mp = mp
+            self._observe_mp_presses(mp, now)
         if hp is None and mp is None:
             return []
         self._reads += 1

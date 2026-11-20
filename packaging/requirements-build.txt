@@ -1,0 +1,14 @@
+# Top-level pins for the SEPARATE build venv (never the live venv). The runtime pins match the
+# live venv verified on 2026-11-18 (CPython 3.13.1). The PyInstaller pin was verified on
+# 2026-11-18: it builds and passes `maplebot-cli selftest --strict` on CPython 3.13.1 with numpy 2.5
+# and opencv-python 5.0 (see docs/PACKAGING.md). Installs use the hashed
+# requirements-build.lock generated from these pins (build_exe.ps1 -RefreshLock).
+numpy==2.5.4
+opencv-python==5.0.0.93
+mss==10.2.0
+pynput==1.8.2
+six==1.17.0
+pywin32==312
+PyYAML==6.0.3
+windows-capture==2.0.1
+pyinstaller==6.16.0

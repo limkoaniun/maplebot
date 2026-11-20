@@ -29,6 +29,23 @@ def test_manual_request_preflight_failure_is_visible_without_active_recovery():
     assert gui._recovery_display({"recovery_state": "completed", "recovery_reason": "Reached point 1."}) is None
 
 
+def test_regaining_support_stage_is_shown_with_its_progress_and_failure_reason():
+    status = {"returning_to_start": True, "recovery_from_index": 0, "return_count": 1, "foreground": True,
+              "recovery_state": "regaining_support", "circuit_state": "return_regain_walking",
+              "recovery_reason": "Walking left toward drawn platform ground"}
+    label, detail = gui._recovery_display(status)
+    assert label == "Returning to point 1"
+    assert "point 1" in detail and "attempt 1" in detail
+    assert "Walking left toward drawn platform ground" in detail and "Bring MapleStory" not in detail
+    _, detail = gui._recovery_display({**status, "recovery_reason": None})
+    assert "Regaining support" in detail
+    reason = ("Could not reach a drawn platform from (65,95): no horizontal progress. Move the character "
+              "onto a drawn platform or draw this surface in the map editor.")
+    label, detail = gui._recovery_display({"recovery_terminal": True, "recovery_from_index": 0,
+        "recovery_state": "failed", "recovery_reason": reason})
+    assert label == "Recovery stopped" and reason in detail
+
+
 def test_paused_return_is_identified_in_status():
     _, detail = gui._recovery_display({"returning_to_start": True, "paused": True})
     assert "Paused." in detail and "Bring MapleStory" not in detail
