@@ -1,7 +1,7 @@
 # Octopus template source
 
 Copied without modification from the user-provided reference checkout:
-`~/Dev/maplestory-auto-ds/monster/zhang_yu/`
+`maplestory-auto-ds/monster/zhang_yu/` (a local WSL checkout of the reference project)
 
 Reference checkout commit: `8c1f53f`.
 Copied on 2026-11-14. The reference assets were visually verified as Octopus sprites;

@@ -19,6 +19,14 @@ from maplebot.vision.player import locate_by_template
 ROOT = Path(__file__).resolve().parents[1]
 FIX = Path(__file__).parent / "fixtures" / "nametags"
 EXPECTED = json.loads((FIX / "expected.json").read_text())
+NAMETAG = ROOT / "assets" / "player-nametag.png"
+HEAD = ROOT / "assets" / "player-head.png"
+
+# The template and the recorded frames show the character's in-game name, so they are
+# git-ignored local files (the repository is public). Without them these regressions skip.
+_LOCAL = [NAMETAG, HEAD] + [FIX / f"{name}.png" for name in EXPECTED]
+_MISSING = [p.relative_to(ROOT).as_posix() for p in _LOCAL if not p.is_file()]
+pytestmark = pytest.mark.skipif(bool(_MISSING), reason="local private nametag files absent: " + ", ".join(_MISSING))
 
 
 def frame(name):
@@ -31,12 +39,12 @@ def bot(center=9, threshold=.12, center_threshold=.11):
     cfg = deep_merge(load_config(), {"player": {
         "locator": "hybrid",
         "nametag": {
-            "path": str(ROOT / "assets" / "player-nametag.png"),
+            "path": str(NAMETAG),
             "offset": [0, -32], "split_width": 20, "diff_thres": threshold,
             "center_occlusion_px": center,
             "center_occlusion_diff_thres": center_threshold,
         },
-        "appearance": {"path": str(ROOT / "assets" / "player-head.png")},
+        "appearance": {"path": str(HEAD)},
         "hybrid": {"max_fallback_frames": 0},
     }})
     return Bot(cfg, None, None, MonsterLibrary(), None)
@@ -58,7 +66,7 @@ def test_recorded_ladder_explains_original_failure_and_recovers_identity():
 
 def test_occlusion_mask_keeps_original_mask_and_both_sides():
     b = bot()
-    original = cv2.imread(str(ROOT / "assets" / "player-nametag.png"), -1)[:, :, 3]
+    original = cv2.imread(str(NAMETAG), -1)[:, :, 3]
     assert np.array_equal(b._tmpl_mask, original)
     assert np.array_equal(b._nametag_occlusion_mask[:, :21], original[:, :21])
     assert np.array_equal(b._nametag_occlusion_mask[:, 30:], original[:, 30:])

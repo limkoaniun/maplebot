@@ -182,7 +182,7 @@ def run(args) -> int:
     manifest.update(python=platform.python_version(), packages=installed_packages())
     (app / "maplebot-install.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
-    tokens = stage_mod.deny_tokens(args.deny_token)
+    tokens = stage_mod.deny_tokens(args.deny_token, repo=repo)
     errors, warnings = audit_dist.audit(app, stage=stage_dir, public=args.public, tokens=tokens,
                                         build_root=build_root)
     for line in warnings:

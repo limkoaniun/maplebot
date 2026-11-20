@@ -76,7 +76,7 @@ HP/MP/EXP readings. **Game view** is a separate live window capture and also wor
 while the controller is stopped. Closing settings closes its preview; use Stop or
 F12 to stop the controller. The pickup counter counts key presses, not collected items.
 
-The local player profile uses Z for Double Stab, Alt for normal attack, C to jump,
+The local example profile uses Z for Double Stab, Alt for normal attack, C to jump,
 Q/A for HP/MP potions, and X for pickup. Its monster matches require both shape and
 color agreement. Character tracking uses the nametag with a short, local head-image
 fallback; missing capture or prolonged missing character/minimap detection stops input.

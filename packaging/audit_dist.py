@@ -25,7 +25,7 @@ TOP_LEVEL_EXTRA = ("README-FIRST.txt", "maplebot-install.json")
 FORBIDDEN_PATTERNS = ("config/user.yaml", "config/user.yaml.*", "*/map_profiles", "*/map_profiles/*",
                       "map_profiles", "log", "log/*", "screenshot", "screenshot/*", "video", "video/*",
                       "tests", "tests/*", "*.jsonl", "*.log", "*active-status.json", "*relay-*.png", "*.ps1",
-                      "*calibrate_player.py", "*maplebot/_build_info.py", "*maplebot/_build_info.pyc")
+                      "*calibrate_*.py", "*maplebot/_build_info.py", "*maplebot/_build_info.pyc")
 # Everything the interpreter imports from a sys.path folder (.py, .pyw, .pyc, .pyd, tagged .pyd)
 # plus .pth; a folder holding __init__ with any module suffix is a package.
 MODULE_SUFFIXES = tuple(sorted({suffix.lower() for suffix in importlib.machinery.all_suffixes()}))

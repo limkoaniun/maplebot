@@ -8,7 +8,7 @@ Maplebot observes screen pixels and sends ordinary keyboard input. The user want
 
 The minimap is used for position, map recognition, and following the saved graph. The program does not automatically discover an optimal farming route for any map. Different maps need their own profiles, reachable connections, and supervised validation.
 
-The active development checkout is `%USERPROFILE%\source\repos\maplebot`; the upstream is the private repository `limkoaniun/maplebot`, branch `master`. The WSL checkout is separate. Do not overwrite the Windows checkout from it without comparing changes.
+The active development checkout is `%USERPROFILE%\source\repos\maplebot`; the upstream is the public GitHub repository configured as `origin`, branch `master`. Because it is public, the character's nametag/appearance crops, recorded nametag frames and the build's private deny tokens are git-ignored local files (see `assets/README.md`). The WSL checkout is separate. Do not overwrite the Windows checkout from it without comparing changes.
 
 ## What is included and what stays local
 
@@ -18,7 +18,7 @@ Live `config/user.yaml`, `config/map_profiles/`, `log/`, `screenshot/`, and `vid
 
 On this PC, existing local files remain the source of truth for the running character. On a fresh clone, read [examples/construction-site/README.md](../examples/construction-site/README.md) to restore the saved setup deliberately. Do not copy it over an existing configuration as part of normal startup.
 
-The historical `scripts/calibrate_player.py` helper is local-only: it depends on an old capture in `log/` and overwrites a character asset. It is not a supported general calibration command.
+The historical character calibration helper (`scripts/calibrate_*.py`, git-ignored) is local-only: it depends on an old capture in `log/` and overwrites a character asset. It is not a supported general calibration command.
 
 ## Setup and entry points
 
@@ -216,7 +216,7 @@ Do not solve these issues by disabling focus/freshness/map guards, increasing to
 
 ## Reference implementations and local geometry research
 
-The original rewrite was informed by `MapleStoryAutoLevelUp` and `maplestory-auto-ds`. Local reference checkouts are `~/Dev/MapleStoryAutoLevelUp` and `~/Dev/maplestory-auto-ds`; consult their actual code when borrowing an approach. Their existence does not make them dependencies or establish that their behavior is safe for this game's calibration.
+The original rewrite was informed by `MapleStoryAutoLevelUp` and `maplestory-auto-ds`. Local reference checkouts are `~/Dev/MapleStoryAutoLevelUp` and `~/Dev/maplestory-auto-ds` in WSL; consult their actual code when borrowing an approach. Their existence does not make them dependencies or establish that their behavior is safe for this game's calibration.
 
 How the two references time and position movement (read from their code on 2026-11-16; nothing was run):
 - `MapleStoryAutoLevelUp` (`src/engine/MapleStoryAutoLevelUp.py`, `src/states/hunting.py`, `src/input/KeyBoardController.py`): no waypoints, alignment phase or per-waypoint clock. The nearest painted pixel of a route image within `route.search_range` (10 px) becomes the command, a takeoff is a painted zone several pixels wide, keys stay down until the command changes, and the only time bound is lack of progress (`is_player_stuck`: under 10 px in 10 s, then a random action). Fighting overrides the route command every frame; there is no return mode.

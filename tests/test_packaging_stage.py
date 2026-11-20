@@ -5,6 +5,7 @@ __init__.py there would shadow the PyPI ``packaging`` library).
 """
 from __future__ import annotations
 
+import fnmatch
 import importlib.util
 import json
 import shutil
@@ -88,14 +89,39 @@ def test_script_import_scan_reads_text_only():
     assert "run_active" not in sys.modules and not (set(sys.modules) - before) & {"win32api", "win32event"}
 
 
-def test_privacy_scan_documents_why_public_is_blocked(tmp_path):
-    for relative in ("scripts/run_active.py", "monster/octopus/SOURCE.md"):
+def test_privacy_scan_reports_each_file_and_token(tmp_path):
+    for relative, text in (("scripts/run_active.py", "print('Starting for SamplePlayer')\n"),
+                           ("monster/octopus/SOURCE.md", "ok\ncopied from /home/someone/refs\n")):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(REPO / relative, target)
-    hits = stage.privacy_scan(tmp_path, ["player", "/home/"])
-    assert any(path == "scripts/run_active.py" and token == "player" for path, _, token in hits)
-    assert any(path == "monster/octopus/SOURCE.md" and token == "/home/" for path, _, token in hits)
+        target.write_text(text, encoding="utf-8")
+    hits = stage.privacy_scan(tmp_path, ["sampleplayer", "/home/"])
+    assert ("scripts/run_active.py", 1, "sampleplayer") in hits
+    assert ("monster/octopus/SOURCE.md", 2, "/home/") in hits
+
+
+def test_private_tokens_come_from_the_ignored_local_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("USERNAME", "ab")
+    assert stage.private_tokens(tmp_path) == [] and stage.deny_tokens(repo=tmp_path) == sorted(stage.BASE_DENY_TOKENS)
+    path = tmp_path / stage.PRIVATE_TOKENS_FILE
+    path.parent.mkdir(parents=True)
+    path.write_text("# comment\nSamplePlayer  # my IGN\n\nab\nsomeuser\n", encoding="utf-8")
+    assert stage.private_tokens(tmp_path) == ["SamplePlayer", "someuser"]  # "ab" is too short
+    assert {"sampleplayer", "someuser"} <= set(stage.deny_tokens(repo=tmp_path))
+    assert "sampleplayer" not in stage.deny_tokens()
+
+
+def test_repository_ignores_the_private_files():
+    if shutil.which("git") is None:
+        pytest.skip("git is not available")
+    for relative in ("assets/player-nametag.png", "assets/player-head.png", "tests/fixtures/nametags/x.png",
+                     stage.PRIVATE_TOKENS_FILE, "scripts/calibrate_player.py"):
+        result = subprocess.run(["git", "-C", str(REPO), "check-ignore", "-q", "--no-index", relative])
+        assert result.returncode == 0, relative
+    tracked = stage.tracked_files(REPO)
+    assert not [p for p in tracked if fnmatch.fnmatchcase(p, stage.PERSONAL_ASSET_PATTERN)]
+    assert not [p for p in tracked if p.startswith("tests/fixtures/nametags/") and p.endswith(".png")]
+    assert stage.PRIVATE_TOKENS_FILE not in tracked
 
 
 def _commit(repo, message):
@@ -115,8 +141,9 @@ def _git_repo(tmp_path):
         "scripts/supervise_farming.py": "import argparse\n", "scripts/verify_lap.py": "",
         "config/default.yaml": "a: 1\n", "config/user.example.yaml": "{}\n",
         "packaging/maplebot.spec": "", "packaging/maplebot_entry.py": "", "packaging/README-FIRST.txt": "x\n",
-        "monster/snail/snail.png": "png", "assets/player-nametag.png": "png", "assets/gain.png": "png",
-        "examples/construction-site/user.yaml": "{}\n", ".gitignore": "config/user.yaml\nconfig/map_profiles/\nlog/\n",
+        "monster/snail/snail.png": "png", "assets/gain.png": "png",
+        "examples/construction-site/user.yaml": "player:\n  nametag: {path: assets/player-nametag.png}\n",
+        ".gitignore": "config/user.yaml\nconfig/map_profiles/\nlog/\nassets/player-*\npackaging/private-tokens.txt\n",
         # Public builds drop these two (they name private paths in the real repo).
         "assets/README.md": "crops from /home/someone/captures\n", "monster/snail/SOURCE.md": "from /home/someone\n",
     }
@@ -132,6 +159,11 @@ def _git_repo(tmp_path):
     (repo / "config" / "map_profiles" / "mine.json").write_text("{}", encoding="utf-8")
     (repo / "log").mkdir()
     (repo / "log" / "active-status.json").write_text("{}", encoding="utf-8")
+    # The character's crop and the private tokens are git-ignored like in the real repo; personal
+    # builds copy the crop from disk and public builds read the tokens.
+    (repo / "assets" / "player-nametag.png").write_bytes(b"\x89PNG private nametag")
+    (repo / "assets" / "player-old.png").write_bytes(b"\x89PNG stray crop the example does not name")
+    (repo / "packaging" / "private-tokens.txt").write_text("sampleplayer\n", encoding="utf-8")
     return repo
 
 
@@ -148,6 +180,9 @@ def test_stage_from_git_archive_and_dirty_handling(tmp_path):
     assert set(modules["script_imports"]) == {"win32api", "msvcrt", "argparse"}
     assert manifest["dirty"] is False and manifest["example_included"] is True and manifest["public"] is False
     assert "config/default.yaml" in manifest["files"] and "assets/player-nametag.png" in manifest["files"]
+    assert (tmp_path / "stage" / "assets" / "player-nametag.png").read_bytes() == b"\x89PNG private nametag"
+    assert not (tmp_path / "stage" / "assets" / "player-old.png").exists()  # only what the example names
+    assert stage.dirty_paths(repo) == []  # the ignored crop does not make the tree dirty
     info = (tmp_path / "stage" / "maplebot" / "_build_info.py").read_text()
     assert f"COMMIT = '{manifest['commit']}'" in info and "VERSION = '0.1.0'" in info
 
@@ -161,6 +196,7 @@ def test_stage_from_git_archive_and_dirty_handling(tmp_path):
     dirty = stage.stage(repo, tmp_path / "dirty", allow_dirty=True)
     assert dirty["dirty"] is True
     assert (tmp_path / "dirty" / "maplebot" / "gui.py").read_text() == "# edited\n"
+    assert (tmp_path / "dirty" / "assets" / "player-nametag.png").is_file()
     assert not (tmp_path / "dirty" / "config" / "user.yaml").exists()
     assert not (tmp_path / "dirty" / "config" / "map_profiles").exists()
 
@@ -171,10 +207,40 @@ def test_stage_from_git_archive_and_dirty_handling(tmp_path):
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
 def test_public_stage_fails_on_private_text(tmp_path):
     repo = _git_repo(tmp_path)
-    (repo / "scripts" / "run_active.py").write_text("print('hello player')\n", encoding="utf-8")
+    (repo / "scripts" / "run_active.py").write_text("print('hello SamplePlayer')\n", encoding="utf-8")
     _commit(repo, "greeting")
-    with pytest.raises(stage.StageError, match="private text"):
+    with pytest.raises(stage.StageError, match=r"scripts/run_active.py:1 \(sampleplayer\)"):
+        stage.stage(repo, tmp_path / "public", public=True)  # token from the git-ignored file
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
+def test_public_stage_refuses_without_private_tokens(tmp_path):
+    repo = _git_repo(tmp_path)
+    (repo / "packaging" / "private-tokens.txt").unlink()
+    with pytest.raises(stage.StageError, match="private tokens"):
         stage.stage(repo, tmp_path / "public", public=True)
+    (repo / "packaging" / "private-tokens.txt").write_text("﻿# only a comment\nab\n", encoding="utf-8")
+    with pytest.raises(stage.StageError, match="private tokens"):
+        stage.stage(repo, tmp_path / "public", public=True)
+    assert stage.stage(repo, tmp_path / "flag", public=True, extra_tokens=["sampleplayer"])["public"] is True
+    assert stage.stage(repo, tmp_path / "personal")["public"] is False  # personal builds do not need it
+    (repo / "packaging" / "private-tokens.txt").write_text("﻿sampleplayer\n", encoding="utf-8")
+    assert stage.private_tokens(repo) == ["sampleplayer"]  # a BOM does not hide the first token
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
+def test_personal_stage_requires_the_local_character_crops(tmp_path):
+    repo = _git_repo(tmp_path)
+    (repo / "assets" / "player-nametag.png").unlink()
+    with pytest.raises(stage.StageError, match=r"local character crops \(git-ignored\): assets/player-nametag.png"):
+        stage.stage(repo, tmp_path / "personal")
+    (repo / "examples" / "construction-site" / "user.yaml").write_text(
+        "player:\n  nametag: {path: assets/mine.png}\n", encoding="utf-8")
+    _commit(repo, "odd crop name")
+    with pytest.raises(stage.StageError, match="must match assets/player-"):
+        stage.stage(repo, tmp_path / "odd")
+    assert stage.stage(repo, tmp_path / "lean", no_example=True)["example_included"] is False
+    assert stage.stage(repo, tmp_path / "public", public=True)["public"] is True
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
@@ -328,7 +394,7 @@ def _fake_dist(tmp_path, monkeypatch, *, example=False):
 
 def test_audit_passes_a_clean_dist(tmp_path, monkeypatch):
     app, stage_dir, _ = _fake_dist(tmp_path, monkeypatch)
-    assert audit_dist.audit(app, stage=stage_dir, public=True, tokens=["player"]) == ([], [])
+    assert audit_dist.audit(app, stage=stage_dir, public=True, tokens=["sampleplayer"]) == ([], [])
     app, stage_dir, _ = _fake_dist(tmp_path / "with-example", monkeypatch, example=True)
     assert audit_dist.audit(app, stage=stage_dir) == ([], [])
 
@@ -336,11 +402,11 @@ def test_audit_passes_a_clean_dist(tmp_path, monkeypatch):
 def test_audit_private_text_in_scripts_fails_public_and_warns_personal(tmp_path, monkeypatch):
     app, stage_dir, _ = _fake_dist(tmp_path, monkeypatch)
     for folder in (app / "_internal" / "scripts", stage_dir / "scripts"):
-        (folder / "run_active.py").write_text("print('hello player')\n", encoding="utf-8")
-    errors, warnings = audit_dist.audit(app, stage=stage_dir, public=True, tokens=["player"])
-    assert any("_internal/scripts run_active.py: player" in e for e in errors) and warnings == []
-    errors, warnings = audit_dist.audit(app, stage=stage_dir, public=False, tokens=["player"])
-    assert errors == [] and any("run_active.py: player" in w for w in warnings)
+        (folder / "run_active.py").write_text("print('hello SamplePlayer')\n", encoding="utf-8")
+    errors, warnings = audit_dist.audit(app, stage=stage_dir, public=True, tokens=["sampleplayer"])
+    assert any("_internal/scripts run_active.py: sampleplayer" in e for e in errors) and warnings == []
+    errors, warnings = audit_dist.audit(app, stage=stage_dir, public=False, tokens=["sampleplayer"])
+    assert errors == [] and any("run_active.py: sampleplayer" in w for w in warnings)
 
 
 def test_audit_pyz_build_root_paths(tmp_path, monkeypatch):
@@ -502,5 +568,5 @@ def test_lock_lines(tmp_path):
 def test_shipped_text_has_no_private_tokens():
     for relative in ("packaging/README-FIRST.txt", "packaging/maplebot.spec", "packaging/maplebot_entry.py"):
         text = (REPO / relative).read_text(encoding="utf-8").lower()
-        for token in stage.BASE_DENY_TOKENS:
+        for token in stage.deny_tokens(repo=REPO):  # includes the local private tokens when present
             assert token not in text, (relative, token)

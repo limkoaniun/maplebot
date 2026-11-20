@@ -356,7 +356,7 @@ def run():
     session = None
     evidence_tracker = None
     final = {}  # last on-screen evidence and hp/mp/exp readings, kept for the stop publish
-    print('Starting active Maplebot for player. F1 pause/resume, F12 stop.', flush=True)
+    print('Starting active Maplebot. F1 pause/resume, F12 stop.', flush=True)
     while not STOP.exists():
         normal_cfg = load_config(str(ROOT / 'config/user.yaml'))
         cfg = session.cfg if session is not None else normal_cfg

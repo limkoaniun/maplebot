@@ -34,10 +34,15 @@ ALLOW_FILES = ("scripts/run_active.py", "scripts/relay_client.py", "scripts/supe
 DENY_PATTERNS = ("config/user.yaml", "config/user.yaml.*", "config/map_profiles", "config/map_profiles/*",
                  "log/*", "screenshot/*", "video/*", "tests/*", "*/__pycache__/*", "__pycache__/*",
                  "*.pyc", "*.jsonl", "*.log", "*.egg-info/*", ".git/*", "*.ps1", "*.tmp", "*.before-import-*",
-                 "scripts/calibrate_player.py", "maplebot/_build_info.py", "*active-status.json", "*relay-*.png")
+                 "scripts/calibrate_*.py", "maplebot/_build_info.py", "*active-status.json", "*relay-*.png")
 SCRIPTS = ("run_active.py", "relay_client.py", "supervise_farming.py")
 EXAMPLE_PREFIX = "examples/construction-site/"
+# The character's own nametag/head crops. They are git-ignored (the repository is public), so a
+# personal build copies them from the working tree; a --no-example or --public build never ships them.
 PERSONAL_ASSET_PATTERN = "assets/player-*"
+# Git-ignored, one private token per line (in-game name, OS user names...). Every build's privacy
+# scan reads it, so the tokens never have to appear in this public source.
+PRIVATE_TOKENS_FILE = "packaging/private-tokens.txt"
 MANIFEST_PREFIXES = ("monster/", "assets/", "examples/construction-site/")
 # An --allow-dirty build takes untracked files only from these source folders. Data folders
 # (assets/, monster/, examples/) ship tracked files only: the settings app's Browse... copies a
@@ -45,7 +50,7 @@ MANIFEST_PREFIXES = ("monster/", "assets/", "examples/construction-site/")
 UNTRACKED_SOURCE_PREFIXES = ("maplebot/", "packaging/")
 MANIFEST_FILES = ("config/default.yaml", "config/user.example.yaml")
 TEXT_SUFFIXES = (".py", ".md", ".yaml", ".yml", ".json", ".txt")
-BASE_DENY_TOKENS = ("<user>", "<user>", "player", "/home/", "c:\\users\\")
+BASE_DENY_TOKENS = ("/home/", "c:\\users\\")
 
 
 class StageError(RuntimeError):
@@ -156,13 +161,34 @@ def script_imports(stage_root) -> list[str]:
     return sorted(names)
 
 
-def deny_tokens(extra=()) -> list[str]:
+def private_tokens(repo) -> list[str]:
+    """Tokens from the git-ignored PRIVATE_TOKENS_FILE ('#' starts a comment); [] when absent."""
+    path = Path(repo) / PRIVATE_TOKENS_FILE
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8-sig").replace("﻿", "")  # tolerate a BOM from Windows editors
+    lines = (line.split("#", 1)[0].strip() for line in text.splitlines())
+    return [line for line in lines if len(line) >= 3]
+
+
+def deny_tokens(extra=(), repo=None) -> list[str]:
     tokens = list(BASE_DENY_TOKENS)
     user = os.environ.get("USERNAME", "")
     if len(user) >= 3:
         tokens.append(user)
     tokens.extend(t for t in extra if t)
+    if repo is not None:
+        tokens.extend(private_tokens(repo))
     return sorted({t.lower() for t in tokens})
+
+
+def example_character_assets(example_user_yaml) -> list[str]:
+    """The player.nametag/appearance paths the example's user.yaml names, as posix paths."""
+    import yaml
+    data = yaml.safe_load(Path(example_user_yaml).read_text(encoding="utf-8")) or {}
+    player = data.get("player") or {}
+    values = [(player.get(key) or {}).get("path") for key in ("nametag", "appearance")]
+    return sorted({_posix(v) for v in values if v})
 
 
 def privacy_scan(root, tokens) -> list[tuple[str, int, str]]:
@@ -245,6 +271,11 @@ def stage(repo, dest, *, allow_dirty=False, no_example=False, public=False, extr
     if _inside(dest, repo):
         raise StageError(f"the stage folder {dest} must be outside the repository")
     no_example = bool(no_example or public)
+    if public and not private_tokens(repo) and not any(extra_tokens):
+        # The in-game name and user names live only in the git-ignored tokens file: without it
+        # the privacy scan could not catch them, so a public build refuses to guess.
+        raise StageError(f"a public build needs your private tokens in {PRIVATE_TOKENS_FILE} "
+                         "(git-ignored; one per line) or --deny-token")
     dirty = dirty_paths(repo)
     if dirty and public:
         raise StageError("a public build must come from a clean, committed tree (--allow-dirty is not "
@@ -276,6 +307,23 @@ def stage(repo, dest, *, allow_dirty=False, no_example=False, public=False, extr
             with archive.extractfile(members[relative]) as reader, open(target, "wb") as writer:
                 shutil.copyfileobj(reader, writer)
 
+    if not no_example:
+        # The example's character crops are git-ignored, so neither the archive nor the dirty
+        # selection carries them: copy exactly the ones the example names from the working tree,
+        # and refuse an example without them.
+        personal = example_character_assets(dest / EXAMPLE_PREFIX / "user.yaml")
+        odd = [p for p in personal if not fnmatch.fnmatchcase(p, PERSONAL_ASSET_PATTERN)]
+        if odd:
+            raise StageError(f"the example's character crops must match {PERSONAL_ASSET_PATTERN}: {', '.join(odd)}")
+        missing = [p for p in personal if not (repo / p).is_file()]
+        if missing:
+            raise StageError("the example needs your local character crops (git-ignored): "
+                             + ", ".join(missing) + "; add them, or build with --no-example")
+        for relative in personal:
+            target = dest / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(repo / relative, target)
+
     staged = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
     leaked = [p for p in staged if is_denied(p)]
     if leaked:
@@ -285,8 +333,11 @@ def stage(repo, dest, *, allow_dirty=False, no_example=False, public=False, extr
                             "packaging/README-FIRST.txt", "maplebot/app.py") if not (dest / p).is_file()]
     if missing:
         raise StageError("required files are missing from the stage: " + ", ".join(missing))
-    if no_example and "player" in (dest / "config" / "default.yaml").read_text(encoding="utf-8").lower():
-        raise StageError("config/default.yaml references the personal example assets")
+    if no_example:
+        defaults = (dest / "config" / "default.yaml").read_text(encoding="utf-8").lower()
+        personal_prefix = PERSONAL_ASSET_PATTERN.rstrip("*")
+        if personal_prefix in defaults or any(t.lower() in defaults for t in private_tokens(repo)):
+            raise StageError("config/default.yaml references the personal example assets or a private token")
 
     version = project_version(repo)
     commit = _git(repo, "rev-parse", "--short", "HEAD").strip()
@@ -305,7 +356,7 @@ def stage(repo, dest, *, allow_dirty=False, no_example=False, public=False, extr
         encoding="utf-8")
 
     if public:
-        hits = privacy_scan(dest, deny_tokens(extra_tokens))
+        hits = privacy_scan(dest, deny_tokens(extra_tokens, repo=repo))
         if hits:
             raise StageError("a public build would ship private text: "
                              + "; ".join(f"{p}:{n} ({t})" for p, n, t in hits[:20]))

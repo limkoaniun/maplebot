@@ -11,5 +11,11 @@ config/map_profiles/
 build/
 dist/
 
-# One-off calibration helper requires an old private capture and overwrites assets.
-scripts/calibrate_player.py
+# One-off calibration helpers require an old private capture and overwrite assets.
+scripts/calibrate_*.py
+
+# The repository is public. Your character's nametag/appearance crops, the recorded
+# nametag frames that show your name, and the build's private deny tokens stay local.
+assets/player-*
+tests/fixtures/nametags/*.png
+packaging/private-tokens.txt

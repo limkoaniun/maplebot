@@ -207,19 +207,26 @@ def run(strict=False, report=None) -> int:
         for kind, value in templates.items():
             if value and not (root / str(value)).is_file():
                 problems.append(f"evidence template {kind} {value} missing")
+        notes = []
         if included:
             merged = deep_merge(cfg, load_yaml(str(example / "user.yaml")))
             player = merged.get("player") or {}
             for key in ("nametag", "appearance"):
                 value = (player.get(key) or {}).get("path")
                 if value and not (root / str(value)).is_file():
-                    problems.append(f"example player.{key}.path {value} missing")
+                    # A personal build must ship them; a source checkout of the public repository
+                    # has no character crops until the user adds their own (they are git-ignored).
+                    (problems if paths.is_frozen() else notes).append(f"example player.{key}.path {value} missing")
         elif paths.is_frozen():
             if (root / "examples").exists():
                 problems.append("examples\\ is present in a build without the example")
-            if list((root / "assets").glob("player-*")):
-                problems.append("assets\\player-* is present in a build without the example")
-        return (not problems), ("; ".join(problems) or f"example included: {included}")
+            # Only what the build shipped: a user's own assets\player-* crop (Browse..., or copied after
+            # Import settings) is legitimate in any install.
+            shipped = (manifest or {}).get("files") or {}
+            if any(name.startswith("assets/player-") for name in shipped):
+                problems.append("assets\\player-* was shipped in a build without the example")
+        detail = "; ".join(problems) or "; ".join([f"example included: {included}"] + notes)
+        return (not problems), detail
     checks.run("config and data", config_probe)
 
     # 5. Images decode from absolute paths (OpenCV takes narrow paths on Windows).
